@@ -1,0 +1,3 @@
+# 核心零第三方依赖：sqlite3 / asyncio / re 均为标准库。
+# 向量检索（可选，v1.0）通过 sqlite-vec / 外部 Embedding Provider 接入，
+# 未启用时不得成为 import 期硬依赖。

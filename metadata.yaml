@@ -1,0 +1,36 @@
+name: astrbot_plugin_ctm
+display_name: 对话认知中枢
+short_desc: 把话题边界、长期记忆与人格/关系状态收敛为一次联合决策、单次注入
+desc: |-
+  对话认知中枢（Cognitive Turn Manager，CTM）不是又一个记忆插件，而是把
+  「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决策点：
+
+  - 每轮只做一次 `TurnDecision`，只在一个位置注入（`on_llm_request`）；
+  - 软话题边界只压栈不清空，回溯旧话题时弹栈自然衔接；
+  - 断言 / 情节 / 话题摘要按预算装箱后注入，注入量有上限、有记录；
+  - 归档异步执行，失败重试并落 `archive_failures`，不阻塞下一轮；
+  - 默认 SQLite 自包含，可选 LivingMemory / memory_companion 适配器。
+
+  当前为 v0.1 骨架：模块边界、接口签名、DDL 与配置已定稿，判定逻辑待实现。
+version: v0.1.0
+author: xun-hen
+repo: https://github.com/xun-hen/astrbot_plugin_ctm
+astrbot_version: ">=4.26"
+tags:
+  - 记忆
+  - 话题
+  - 人格
+  - 上下文
+  - 陪伴
+  - memory
+  - context
+help: |-
+  CTM 默认无需指令即可工作。
+
+  调试与运维：
+  /ctm status          当前会话话题栈、关系状态、预算
+  /ctm topics          最近话题
+  /ctm memory list     记忆列表
+  /ctm health          适配器 / DB / 队列健康检查
+  /ctm export          导出本会话数据
+tags_tip: 默认配置即可用；建议先以 auto_switch_strategy=soft 观察一周再调阈值。

@@ -1,0 +1,275 @@
+{
+  "basic": {
+    "description": "基础设置",
+    "type": "object",
+    "hint": "总开关、数据库位置与时区。数据默认落在插件自己的数据目录，卸载插件后仍可单独备份。",
+    "obvious_hint": true,
+    "items": {
+      "enabled": {
+        "description": "启用认知中枢",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后不判定、不注入、不归档，插件整体不工作（退化为未安装）。",
+        "obvious_hint": true
+      },
+      "db_path": {
+        "description": "SQLite 数据库路径",
+        "type": "string",
+        "default": "ctm.sqlite3",
+        "hint": "相对路径相对于插件数据目录（data/plugin_data/astrbot_plugin_ctm/）。也可以填绝对路径。WAL 模式，请放在本地磁盘而非网络盘。"
+      },
+      "timezone": {
+        "description": "时区",
+        "type": "string",
+        "default": "Asia/Shanghai",
+        "hint": "用于按天衰减与运维统计的口径。只影响计算，不影响数据库存储（一律存 Unix 时间戳）。"
+      }
+    }
+  },
+  "topic": {
+    "description": "话题状态机",
+    "type": "object",
+    "hint": "软边界只压栈、不清空上下文；硬切换等价于 /new，默认关闭。",
+    "obvious_hint": true,
+    "items": {
+      "auto_switch_enabled": {
+        "description": "启用自动话题判定",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后只记录、不切话题，适合先观察判定准确率。"
+      },
+      "auto_switch_strategy": {
+        "description": "判定的执行方式",
+        "type": "string",
+        "default": "soft",
+        "options": ["off", "soft", "hard"],
+        "hint": "off=只判定不动作；soft=压栈软边界（推荐）；hard=执行会话硬切换（等价 /new，旧上下文不再参与本轮）。",
+        "obvious_hint": true
+      },
+      "topic_threshold": {
+        "description": "话题相似度阈值",
+        "type": "float",
+        "default": 0.55,
+        "hint": "消息文本与当前话题的相似度低于该值才可能触发软边界。0~1，越大越敏感。"
+      },
+      "min_turns_before_switch": {
+        "description": "切换前最少轮数",
+        "type": "int",
+        "default": 3,
+        "hint": "新话题至少持续这么多轮才允许切换，抑制「每句话都换话题」的抖动。"
+      },
+      "switch_cooldown_seconds": {
+        "description": "切换冷却（秒）",
+        "type": "int",
+        "default": 120,
+        "hint": "两次软边界之间的最小间隔，防止连续误判。"
+      },
+      "preserve_recent_topics": {
+        "description": "保留最近话题数",
+        "type": "int",
+        "default": 2,
+        "hint": "注入记忆包时，最近 N 个话题的摘要作为候选；回溯更早的话题靠断言与情节。"
+      },
+      "sticky_keywords": {
+        "description": "粘性关键词",
+        "type": "list",
+        "default": ["承诺", "答应", "生日", "纪念日", "难过", "生病", "吵架", "对不起"],
+        "hint": "命中后禁止硬切，并降低软切灵敏度。精确匹配，区分大小写。"
+      },
+      "sticky_regex": {
+        "description": "粘性正则",
+        "type": "list",
+        "default": [],
+        "hint": "与粘性关键词同样效果，按正则匹配。写错正则会跳过该条并记 WARN。"
+      },
+      "new_intent_markers": {
+        "description": "新意图标记词",
+        "type": "list",
+        "default": ["另外", "话说", "换个话题", "对了", "突然想到"],
+        "hint": "出现这些词时，即使相似度没低到阈值也可能判为新话题（双信号中的第二个信号）。"
+      }
+    }
+  },
+  "memory": {
+    "description": "记忆与预算",
+    "type": "object",
+    "hint": "注入预算按 Token 计，超预算按优先级丢弃，并记 dropped_items。",
+    "obvious_hint": true,
+    "items": {
+      "injection_budget_tokens": {
+        "description": "每轮注入 Token 预算",
+        "type": "int",
+        "default": 1000,
+        "hint": "固定块（话题状态 + 关系状态 + 人格提示）优先占用，剩余给摘要/断言/情节。"
+      },
+      "summary_limit": {
+        "description": "话题摘要条数上限",
+        "type": "int",
+        "default": 2
+      },
+      "assertion_limit": {
+        "description": "用户断言条数上限",
+        "type": "int",
+        "default": 3
+      },
+      "episode_limit": {
+        "description": "情节记忆条数上限",
+        "type": "int",
+        "default": 2
+      },
+      "recency_half_life_days": {
+        "description": "新近度半衰期（天）",
+        "type": "float",
+        "default": 14.0,
+        "hint": "recency = 0.5 ** (age_days / half_life)。越小越偏向最新记忆。"
+      },
+      "w_relevance": {
+        "description": "相关性权重",
+        "type": "float",
+        "default": 0.45
+      },
+      "w_salience": {
+        "description": "情感显著性权重",
+        "type": "float",
+        "default": 0.35
+      },
+      "w_recency": {
+        "description": "新近度权重",
+        "type": "float",
+        "default": 0.15
+      },
+      "w_usage": {
+        "description": "使用反馈权重",
+        "type": "float",
+        "default": 0.05,
+        "hint": "四项权重之和建议为 1.0；不等 1 时会按和归一化。"
+      },
+      "assertion_confidence_threshold": {
+        "description": "断言置信度阈值",
+        "type": "float",
+        "default": 0.7,
+        "hint": "低于该值的断言只写日志、不入库。"
+      },
+      "episode_salience_threshold": {
+        "description": "情节显著性阈值",
+        "type": "float",
+        "default": 0.6,
+        "hint": "情绪强度或粘性命中达到该值才写情节记忆。"
+      }
+    }
+  },
+  "relationship": {
+    "description": "关系状态",
+    "type": "object",
+    "hint": "亲密度 / 张力是慢变量：只做小幅更新与自然衰减，避免被单轮情绪带偏。",
+    "obvious_hint": true,
+    "items": {
+      "enabled": {
+        "description": "启用关系状态",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后不读写 relationship_state，注入模板中去掉【关系状态】块。"
+      },
+      "intimacy_decay_per_day": {
+        "description": "亲密度每天衰减",
+        "type": "float",
+        "default": 0.01,
+        "hint": "长期无互动时缓慢回落，避免「一次热聊永久 1.0」。"
+      },
+      "tension_decay_per_turn": {
+        "description": "张力每轮衰减系数",
+        "type": "float",
+        "default": 0.98,
+        "hint": "每轮 tension *= 该值，冲突后自然缓和。取值 (0,1]。"
+      },
+      "promise_detection_enabled": {
+        "description": "承诺检测",
+        "type": "bool",
+        "default": true,
+        "hint": "规则匹配「答应/我会/明天…」写入 pending_promises，作为未完成事项注入。"
+      }
+    }
+  },
+  "adapter": {
+    "description": "存储适配器",
+    "type": "object",
+    "hint": "默认 SQLite 自包含。外部适配器不可用时回退 SQLite，并记 WARN，不允许崩溃。",
+    "obvious_hint": true,
+    "items": {
+      "backend": {
+        "description": "记忆后端",
+        "type": "string",
+        "default": "sqlite",
+        "options": ["sqlite", "living_memory", "memory_companion"],
+        "hint": "living_memory / memory_companion 需要对应插件已安装并加载。"
+      },
+      "fallback_sqlite": {
+        "description": "失败回退 SQLite",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后适配器失败会导致本轮不注入记忆（但仍然不崩）。建议保持开启。"
+      },
+      "fallback_markdown": {
+        "description": "额外落 Markdown 备份",
+        "type": "bool",
+        "default": true,
+        "hint": "归档时同步写一份人类可读的 Markdown 摘要，便于迁移与人工检查。"
+      }
+    }
+  },
+  "injection": {
+    "description": "注入策略",
+    "type": "object",
+    "hint": "CTM 是唯一注入点。开启后请关闭其他记忆插件的自动注入，否则会重复。",
+    "obvious_hint": true,
+    "items": {
+      "include_meta": {
+        "description": "注入元信息",
+        "type": "bool",
+        "default": false,
+        "hint": "把 turn_id / 预算使用量写进 Prompt。默认关闭，只写日志。"
+      },
+      "soft_boundary_once": {
+        "description": "软边界提示只注入一次",
+        "type": "bool",
+        "default": true,
+        "hint": "软边界当轮注入【话题状态】提示，注入成功后清除 soft_boundary_pending。"
+      },
+      "max_prompt_growth_ratio": {
+        "description": "注入不超过原 Prompt 的比例",
+        "type": "float",
+        "default": 0.25,
+        "hint": "注入内容相对原 system_prompt 长度的上限（按字符估算），防止小模型被记忆挤爆。0 表示不限制。"
+      }
+    }
+  },
+  "observability": {
+    "description": "可观测性",
+    "type": "object",
+    "hint": "决策、丢弃项、失败码都可通过日志与 /ctm status 观测。",
+    "items": {
+      "log_decisions": {
+        "description": "记录每轮决策",
+        "type": "bool",
+        "default": true
+      },
+      "log_dropped_items": {
+        "description": "记录被预算丢弃的条目",
+        "type": "bool",
+        "default": true
+      },
+      "log_level": {
+        "description": "插件日志级别",
+        "type": "string",
+        "default": "INFO",
+        "options": ["DEBUG", "INFO", "WARNING", "ERROR"]
+      },
+      "log_redact": {
+        "description": "日志脱敏",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后日志中的记忆内容只记录长度与哈希前缀，不落原文。"
+      }
+    }
+  }
+}
