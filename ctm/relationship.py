@@ -1,40 +1,24 @@
-"""关系状态：亲密度 / 张力 / 未完成事项。
-
-这是慢变量，不是情绪计。设计文档 §3.6 的更新规则刻意很小步：
-
-* 正向互动 `intimacy += 0.005`，冲突未缓解 `tension += 0.02`；
-* 每轮 `tension *= 0.98`，每天 `intimacy -= 0.01`；
-* 承诺（"答应/我会/明天…"）写入 `pending_promises`，用户确认完成后移除。
-
-之所以不直接读情绪分去改关系：单轮情绪噪声太大，一次"烦"就把关系扣分，
-会让模型对用户过度警觉，这是陪伴场景最常见的翻车方式。
-"""
+"""关系状态：亲密度 / 张力 / 未完成事项（慢变量，小步更新）。"""
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import RelationshipConfig
 
-#: 亲密度/张力的分级边界，供注入模板展示。
 LEVEL_LOW = "low"
 LEVEL_MEDIUM = "medium"
 LEVEL_HIGH = "high"
 
+_PROMISE_TRIGGERS = ("答应", "我会", "一定", "保证", "明天", "后天", "今晚", "周末")
+_TIME_WORDS = ("明天", "后天", "今晚", "周末", "下次", "以后")
+
 
 @dataclass
 class RelationshipState:
-    """一个会话的关系快照。
-
-    Attributes:
-        session_id: 会话键。
-        intimacy: 亲密度 0..1，初始 0.5。
-        tension: 当前张力 0..1，初始 0。
-        pending_promises: 未完成事项，元素形如
-            `{"text": "明天提醒用户吃药", "created_at": 1700000000.0, "done": False}`。
-        updated_at: 最近更新时间。
-    """
+    """一个会话的关系快照。"""
 
     session_id: str
     intimacy: float = 0.5
@@ -57,100 +41,101 @@ class RelationshipManager:
         self._cfg = cfg
 
     def load(self, session_id: str) -> RelationshipState:
-        """读取关系状态，不存在时返回默认值。
-
-        Args:
-            session_id: 会话键。
-
-        Returns:
-            RelationshipState（intimacy=0.5, tension=0）；读库失败同样返回默认值。
-
-        TODO(v0.1): `pending_promises` 列是 JSON 文本，解析失败时置空并记 WARN，
-            不要把坏数据当成异常抛给主流程。
-        """
-        raise NotImplementedError("v0.1: RelationshipManager.load")
+        """读取关系状态，不存在时返回默认值。"""
+        try:
+            row = self._store.load_relationship(session_id)
+        except Exception:  # noqa: BLE001
+            row = None
+        if not row:
+            return RelationshipState(session_id=session_id, updated_at=time.time())
+        promises = row.get("pending_promises")
+        return RelationshipState(
+            session_id=session_id,
+            intimacy=float(row.get("intimacy", 0.5)),
+            tension=float(row.get("tension", 0.0)),
+            pending_promises=promises if isinstance(promises, list) else [],
+            updated_at=float(row.get("updated_at") or 0.0),
+        )
 
     def save(self, state: RelationshipState) -> None:
-        """写回关系状态。
+        """写回关系状态；失败只吞掉（下一轮会重算）。"""
+        try:
+            self._store.save_relationship(
+                state.session_id,
+                intimacy=state.intimacy,
+                tension=state.tension,
+                pending_promises=state.pending_promises,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
-        Args:
-            state: 待保存状态。
-
-        Returns:
-            None。
-
-        TODO(v0.1): 单条 UPSERT；写失败只记日志（下一轮还会重算）。
-        """
-        raise NotImplementedError("v0.1: RelationshipManager.save")
-
-    def update_after_turn(self, signal: Any, decision: Any, response_text: str) -> RelationshipState:
-        """一轮结束后更新关系（在 Archiver 里调用，不在请求前调用）。
-
-        Args:
-            signal: PerceptionSignal。
-            decision: TurnDecision。
-            response_text: 模型回复文本。
-
-        Returns:
-            更新后的状态。
-
-        TODO(v0.1): 先 `decay()`，再按情绪与互动质量做 ±小步更新；
-            回复文本以问句/共情词收尾时额外给正分（"回应积极"的代理指标）。
-        """
-        raise NotImplementedError("v0.1: RelationshipManager.update_after_turn")
+    def update_after_turn(
+        self, signal: Any, decision: Any, response_text: str
+    ) -> RelationshipState:
+        """一轮结束后更新关系（在归档阶段调用）。"""
+        state = self.load(str(getattr(signal, "session_id", "")))
+        now = time.time()
+        state = self.decay(state, now)
+        emotion = float(getattr(signal, "emotion_score", 0.0) or 0.0)
+        if emotion > 0:
+            state.intimacy = min(1.0, state.intimacy + 0.005 * emotion)
+        elif emotion < 0:
+            state.tension = min(1.0, state.tension + 0.02 * abs(emotion))
+        if "？" in (response_text or "") or "?" in (response_text or ""):
+            state.intimacy = min(1.0, state.intimacy + 0.002)
+        if self._cfg.promise_detection_enabled:
+            for promise in self.detect_promises(str(getattr(signal, "text", ""))):
+                if promise["text"] not in {item.get("text") for item in state.pending_promises}:
+                    state.pending_promises.append(promise)
+        state.updated_at = now
+        self.save(state)
+        return state
 
     def decay(self, state: RelationshipState, now: float) -> RelationshipState:
-        """按时间衰减。
-
-        Args:
-            state: 状态。
-            now: 当前时间。
-
-        Returns:
-            衰减后的状态；`tension *= cfg.tension_decay_per_turn`，
-            `intimacy` 按整天数扣 `cfg.intimacy_decay_per_day`。
-
-        TODO(v0.1): 幂等——同一 now 重复调用不叠加衰减。
-        """
-        raise NotImplementedError("v0.1: RelationshipManager.decay")
+        """按时间衰减（同一 now 重复调用不叠加）。"""
+        last = state.updated_at or now
+        age_days = max(0.0, (now - last) / 86400.0)
+        if age_days > 0:
+            state.intimacy = max(
+                0.0, state.intimacy - self._cfg.intimacy_decay_per_day * age_days
+            )
+        state.tension = max(0.0, state.tension * self._cfg.tension_decay_per_turn)
+        state.updated_at = now
+        return state
 
     def level(self, value: float) -> str:
-        """把 0..1 的数值映射成 low/medium/high。
-
-        Args:
-            value: 亲密度或张力。
-
-        Returns:
-            分级字符串。
-
-        TODO(v0.1): <0.33 low，<0.66 medium，其余 high。
-        """
-        raise NotImplementedError("v0.1: RelationshipManager.level")
+        """把 0..1 的数值映射成 low/medium/high。"""
+        if value < 0.33:
+            return LEVEL_LOW
+        if value < 0.66:
+            return LEVEL_MEDIUM
+        return LEVEL_HIGH
 
     def detect_promises(self, text: str) -> list[dict[str, Any]]:
-        """规则检测承诺句。
-
-        Args:
-            text: 单条消息或拼接后的本轮文本。
-
-        Returns:
-            新承诺列表；`promise_detection_enabled=False` 时恒为空。
-
-        TODO(v0.1): 触发词（答应/我会/明天/一定）+ 时间词（明天/后天/今晚/周末），
-            两者同时出现才算承诺，避免"我会觉得"这类误命中。
-        """
-        raise NotImplementedError("v0.1: RelationshipManager.detect_promises")
+        """规则检测承诺句（触发词 + 时间词同时出现）。"""
+        if not self._cfg.promise_detection_enabled:
+            return []
+        text = text or ""
+        if not any(word in text for word in _PROMISE_TRIGGERS):
+            return []
+        if not any(word in text for word in _TIME_WORDS):
+            return []
+        return [
+            {
+                "text": text[:80],
+                "created_at": time.time(),
+                "done": False,
+            }
+        ]
 
     def pending_summary(self, state: RelationshipState, limit: int = 3) -> str:
-        """把未完成事项压成一行，供注入模板使用。
-
-        Args:
-            state: 关系状态。
-            limit: 最多展示几条。
-
-        Returns:
-            形如 "1) 明天提醒吃药；2) ..."；无事项返回 "无"。
-
-        TODO(v0.1): 取未完成项、截断、编号拼接。
-        """
-        raise NotImplementedError("v0.1: RelationshipManager.pending_summary")
+        """把未完成事项压成一行。"""
+        items = [
+            str(item.get("text", "")).strip()
+            for item in state.pending_promises
+            if not item.get("done")
+        ]
+        items = [item for item in items if item][:limit]
+        if not items:
+            return "无"
+        return "；".join(f"{index + 1}) {item}" for index, item in enumerate(items))

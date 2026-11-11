@@ -1,35 +1,35 @@
-"""SQLite 持久层：整个插件唯一的 SQL 出入口。
+"""SQLite 持久层：整个插件唯一的 SQL 出入口（纯标准库）。
 
-为什么收敛到一个类：
-
-* 表只有 7 张（见 `ctm/sql/001_init.sql`），但写入路径分散在话题机、记忆、
-  关系、归档四个模块。把 SQL 散开，事务边界就没人负责；
-* 归档要求"单 worker 串行写"，读要求"不阻塞事件循环"。一个连接 + 显式
-  事务方法，比每个模块各开连接更容易审计；
-* 行对象用 `dict` 传递，`ctm` 上层模块不依赖 sqlite3.Row，单测可直接造假。
-
-线程模型（v0.1 约定，见设计文档 §9）：
-
-* 连接在 `init()` 建立，`check_same_thread=False` + `threading.Lock` 串行化；
-* 主循环只做读（决策路径、命令），写全部发生在 Archiver 单 worker；
-* 若将来读延迟超过预算，再把读挪到 `asyncio.to_thread`，**不要**改成多连接写
-  （WAL 下多写者会互相 `database is locked`）。
-
-相对路径约定：`db_path` 由插件层解析成绝对路径后传入；本类只认绝对路径。
+线程模型：单连接 + `threading.Lock` 串行化；写集中在 Archiver 单 worker，
+读是短查询。时间统一 Unix 秒。
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
-#: 当前 schema 版本，写入 `PRAGMA user_version`；与 sql/ 下的文件名前缀对应。
 SCHEMA_VERSION = 1
-
-#: DDL 文件位置（随包分发，不依赖 cwd）。
 SCHEMA_PATH = Path(__file__).with_name("sql") / "001_init.sql"
+
+
+def dumps(value: Any) -> str:
+    """紧凑 JSON 序列化（中文不转义）。"""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def loads(text: str | None, default: Any) -> Any:
+    """容错 JSON 反序列化。"""
+    if not text:
+        return default
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return default
 
 
 class Store:
@@ -39,7 +39,7 @@ class Store:
         """初始化（不连接）。
 
         Args:
-            db_path: 数据库绝对路径；目录不存在时 `init()` 会创建。
+            db_path: 数据库绝对路径。
         """
         self._path = Path(db_path)
         self._lock = threading.Lock()
@@ -47,93 +47,105 @@ class Store:
 
     # ------------------------------------------------------------------ 生命周期
     def init(self) -> None:
-        """建立连接并应用迁移。
-
-        Returns:
-            None。
-
-        Raises:
-            sqlite3.Error: 打开或迁移失败（插件层负责降级并告警）。
-
-        TODO(v0.1):
-            1. 建父目录；
-            2. `sqlite3.connect(path)`，`row_factory=sqlite3.Row`；
-            3. `PRAGMA journal_mode=WAL` / `foreign_keys=ON` / `busy_timeout=5000`；
-            4. `migrate()`。
-        """
-        raise NotImplementedError("v0.1: Store.init")
+        """建立连接并应用迁移。"""
+        with self._lock:
+            if self._conn is not None:
+                return
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self._path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._conn = conn
+            self.migrate()
 
     def migrate(self) -> None:
-        """按 `PRAGMA user_version` 应用 DDL。
-
-        Returns:
-            None。
-
-        TODO(v0.1): user_version == SCHEMA_VERSION 时直接返回；
-            否则在一个事务里执行 `SCHEMA_PATH`，再写 user_version。
-            版本高于代码时拒绝启动并报错（防止旧代码写新库）。
-        """
-        raise NotImplementedError("v0.1: Store.migrate")
+        """按 `PRAGMA user_version` 应用 DDL。"""
+        conn = self._require()
+        current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if current > SCHEMA_VERSION:
+            raise sqlite3.Error(
+                f"database schema {current} is newer than code {SCHEMA_VERSION}"
+            )
+        if current == SCHEMA_VERSION:
+            return
+        script = SCHEMA_PATH.read_text(encoding="utf-8")
+        conn.executescript(script)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
 
     def close(self) -> None:
-        """关闭连接（先 checkpoint）。
-
-        Returns:
-            None。
-
-        TODO(v0.1): `PRAGMA wal_checkpoint(TRUNCATE)` 后 close；幂等。
-        """
-        raise NotImplementedError("v0.1: Store.close")
+        """checkpoint 后关闭连接；幂等。"""
+        with self._lock:
+            if self._conn is None:
+                return
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            self._conn.close()
+            self._conn = None
 
     def checkpoint(self) -> None:
-        """手动 WAL checkpoint（运维/备份前调用）。
-
-        Returns:
-            None。
-
-        TODO(v0.1): 执行 `PRAGMA wal_checkpoint(TRUNCATE)`；失败只记 WARN。
-        """
-        raise NotImplementedError("v0.1: Store.checkpoint")
+        """手动 WAL checkpoint。"""
+        with self._lock:
+            try:
+                self._require().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
 
     def health(self) -> dict[str, Any]:
-        """健康检查。
-
-        Returns:
-            形如 `{"ok": True, "path": "...", "size_bytes": 0, "tables": 7}`；
-            数据库不可读时 `ok=False` 并带 error。
-
-        TODO(v0.1): 文件存在性 + `SELECT 1` + `sqlite_master` 计数。
-        """
-        raise NotImplementedError("v0.1: Store.health")
+        """健康检查。"""
+        with self._lock:
+            if self._conn is None:
+                return {"ok": False, "error": "not_initialized", "path": str(self._path)}
+            try:
+                self._conn.execute("SELECT 1").fetchone()
+                tables = self._conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+                ).fetchone()[0]
+                size = self._path.stat().st_size if self._path.exists() else 0
+                return {
+                    "ok": True,
+                    "path": str(self._path),
+                    "size_bytes": size,
+                    "tables": int(tables),
+                }
+            except sqlite3.Error as exc:
+                return {"ok": False, "error": str(exc), "path": str(self._path)}
 
     # ------------------------------------------------------------------ sessions
     def ensure_session(self, session_id: str, user_id: str = "") -> None:
-        """确保会话行存在（幂等）。
-
-        Args:
-            session_id: 会话键（unified_msg_origin）。
-            user_id: 发送者 ID；未知时为空串。
-
-        Returns:
-            None。
-
-        TODO(v0.1): `INSERT ... ON CONFLICT(session_id) DO UPDATE SET updated_at`。
-        """
-        raise NotImplementedError("v0.1: Store.ensure_session")
+        """确保会话行存在（幂等）。"""
+        now = self._now()
+        with self._lock:
+            conn = self._require()
+            conn.execute(
+                """
+                INSERT INTO sessions(session_id, user_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET updated_at=excluded.updated_at
+                """,
+                (session_id, user_id, now, now),
+            )
+            conn.commit()
 
     def load_session_state(self, session_id: str) -> dict[str, Any]:
-        """读取会话级话题状态。
-
-        Args:
-            session_id: 会话键。
-
-        Returns:
-            `{"turns_since_switch": 0, "last_switch_at": 0.0, "soft_boundary_pending": False}`；
-            无记录时返回默认值。
-
-        TODO(v0.1): LEFT JOIN 或两次查询；把 INTEGER 0/1 还原成 bool。
-        """
-        raise NotImplementedError("v0.1: Store.load_session_state")
+        """读取会话级话题状态。"""
+        with self._lock:
+            row = self._require().execute(
+                "SELECT * FROM session_state WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        if row is None:
+            return {
+                "turns_since_switch": 0,
+                "last_switch_at": 0.0,
+                "soft_boundary_pending": False,
+            }
+        data = self._row_to_dict(row)
+        data["soft_boundary_pending"] = bool(data.get("soft_boundary_pending"))
+        return data
 
     def save_session_state(
         self,
@@ -143,20 +155,30 @@ class Store:
         last_switch_at: float,
         soft_boundary_pending: bool,
     ) -> None:
-        """写入会话级话题状态（幂等 UPSERT）。
-
-        Args:
-            session_id: 会话键。
-            turns_since_switch: 距上次切换的轮数。
-            last_switch_at: 上次切换时间。
-            soft_boundary_pending: 边界提示是否待注入。
-
-        Returns:
-            None。
-
-        TODO(v0.1): UPSERT 到 session_state；bool 存 0/1。
-        """
-        raise NotImplementedError("v0.1: Store.save_session_state")
+        """写入会话级话题状态（UPSERT）。"""
+        with self._lock:
+            conn = self._require()
+            conn.execute(
+                """
+                INSERT INTO session_state(
+                  session_id, turns_since_switch, last_switch_at,
+                  soft_boundary_pending, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                  turns_since_switch=excluded.turns_since_switch,
+                  last_switch_at=excluded.last_switch_at,
+                  soft_boundary_pending=excluded.soft_boundary_pending,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    session_id,
+                    int(turns_since_switch),
+                    float(last_switch_at),
+                    1 if soft_boundary_pending else 0,
+                    self._now(),
+                ),
+            )
+            conn.commit()
 
     # ------------------------------------------------------------------ topics
     def create_topic(
@@ -166,20 +188,22 @@ class Store:
         summary: str = "",
         topic_key: str | None = None,
     ) -> int:
-        """新建话题。
-
-        Args:
-            session_id: 会话键。
-            title: 标题。
-            summary: 摘要（可空）。
-            topic_key: 归一化键（可空）。
-
-        Returns:
-            新行主键。
-
-        TODO(v0.1): 插入 topics，`last_active_at=created_at=time.time()`。
-        """
-        raise NotImplementedError("v0.1: Store.create_topic")
+        """新建话题，返回主键。"""
+        self.ensure_session(session_id)
+        now = self._now()
+        with self._lock:
+            conn = self._require()
+            cursor = conn.execute(
+                """
+                INSERT INTO topics(
+                  session_id, topic_key, title, summary, status,
+                  created_at, last_active_at
+                ) VALUES (?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (session_id, topic_key, title, summary, now, now),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
 
     def update_topic(
         self,
@@ -190,34 +214,32 @@ class Store:
         status: str | None = None,
         last_active_at: float | None = None,
     ) -> None:
-        """按需更新话题字段。
-
-        Args:
-            topic_id: 主键。
-            title: 新标题；None 表示不改。
-            summary: 新摘要。
-            status: active / archived / popped。
-            last_active_at: 活跃时间。
-
-        Returns:
-            None。
-
-        TODO(v0.1): 动态拼 SET（只更新非 None 字段），全 None 时直接返回。
-        """
-        raise NotImplementedError("v0.1: Store.update_topic")
+        """按需更新话题字段。"""
+        values: dict[str, Any] = {}
+        if title is not None:
+            values["title"] = title
+        if summary is not None:
+            values["summary"] = summary
+        if status is not None:
+            values["status"] = status
+        if last_active_at is not None:
+            values["last_active_at"] = float(last_active_at)
+        if not values:
+            return
+        assignments = ", ".join(f"{key}=:{key}" for key in values)
+        values["topic_id"] = topic_id
+        with self._lock:
+            conn = self._require()
+            conn.execute(f"UPDATE topics SET {assignments} WHERE id=:topic_id", values)
+            conn.commit()
 
     def get_topic(self, topic_id: int) -> dict[str, Any] | None:
-        """按主键取话题。
-
-        Args:
-            topic_id: 主键。
-
-        Returns:
-            行字典；不存在返回 None。
-
-        TODO(v0.1): SELECT * WHERE id=?；Row → dict。
-        """
-        raise NotImplementedError("v0.1: Store.get_topic")
+        """按主键取话题。"""
+        with self._lock:
+            row = self._require().execute(
+                "SELECT * FROM topics WHERE id = ?", (topic_id,)
+            ).fetchone()
+        return self._row_to_dict(row) if row else None
 
     def list_topics(
         self,
@@ -226,46 +248,54 @@ class Store:
         limit: int = 10,
         statuses: Sequence[str] = ("active", "archived"),
     ) -> list[dict[str, Any]]:
-        """列出会话的最近话题（按 last_active_at 倒序）。
-
-        Args:
-            session_id: 会话键。
-            limit: 上限。
-            statuses: 过滤状态。
-
-        Returns:
-            行字典列表；空表返回空列表。
-
-        TODO(v0.1): IN 占位符按 statuses 长度动态拼。
-        """
-        raise NotImplementedError("v0.1: Store.list_topics")
+        """列出会话的最近话题。"""
+        statuses = tuple(statuses)
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        with self._lock:
+            rows = self._require().execute(
+                f"""
+                SELECT * FROM topics
+                WHERE session_id = ? AND status IN ({placeholders})
+                ORDER BY last_active_at DESC LIMIT ?
+                """,
+                (session_id, *statuses, limit),
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def load_topic_stack(self, session_id: str) -> list[dict[str, Any]]:
-        """读取话题栈（position 升序，栈顶在最后）。
-
-        Args:
-            session_id: 会话键。
-
-        Returns:
-            话题行列表，附带 `position` 字段。
-
-        TODO(v0.1): topic_stack JOIN topics ON topic_id。
-        """
-        raise NotImplementedError("v0.1: Store.load_topic_stack")
+        """读取话题栈（position 升序）。"""
+        with self._lock:
+            rows = self._require().execute(
+                """
+                SELECT t.*, s.position AS position
+                FROM topic_stack s JOIN topics t ON t.id = s.topic_id
+                WHERE s.session_id = ? ORDER BY s.position ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def save_topic_stack(self, session_id: str, topic_ids: Sequence[int]) -> None:
-        """整体替换话题栈（事务内先删后插）。
-
-        Args:
-            session_id: 会话键。
-            topic_ids: 从栈底到栈顶的话题主键。
-
-        Returns:
-            None。
-
-        TODO(v0.1): DELETE 后按索引写入 position；空列表等价清栈。
-        """
-        raise NotImplementedError("v0.1: Store.save_topic_stack")
+        """整体替换话题栈（先删后插，事务）。"""
+        with self._lock:
+            conn = self._require()
+            try:
+                conn.execute("BEGIN")
+                conn.execute("DELETE FROM topic_stack WHERE session_id = ?", (session_id,))
+                for position, topic_id in enumerate(topic_ids):
+                    conn.execute(
+                        """
+                        INSERT INTO topic_stack(session_id, position, topic_id, pushed_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (session_id, position, int(topic_id), self._now()),
+                    )
+                conn.commit()
+            except sqlite3.Error:
+                conn.rollback()
+                raise
 
     # ------------------------------------------------------------------ memories
     def insert_memory(
@@ -280,24 +310,31 @@ class Store:
         confidence: float = 1.0,
         source_turn_id: str | None = None,
     ) -> int:
-        """插入一条记忆。
-
-        Args:
-            session_id: 会话键。
-            memory_type: summary / assertion / episode。
-            content: 正文。
-            keywords: 关键词（存 JSON 文本）。
-            salience: 情感显著性 0..1。
-            importance: 重要度 0..1。
-            confidence: 置信度 0..1。
-            source_turn_id: 来源轮次。
-
-        Returns:
-            新行主键。
-
-        TODO(v0.1): keywords 用 `json.dumps(ensure_ascii=False)`。
-        """
-        raise NotImplementedError("v0.1: Store.insert_memory")
+        """插入一条记忆，返回主键。"""
+        self.ensure_session(session_id)
+        with self._lock:
+            conn = self._require()
+            cursor = conn.execute(
+                """
+                INSERT INTO memories(
+                  session_id, type, content, keywords, emotional_salience,
+                  importance, confidence, created_at, source_turn_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    memory_type,
+                    content,
+                    dumps(list(keywords)),
+                    float(salience),
+                    float(importance),
+                    float(confidence),
+                    self._now(),
+                    source_turn_id,
+                ),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
 
     def fetch_memories(
         self,
@@ -306,76 +343,104 @@ class Store:
         *,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """按类型粗筛记忆候选。
+        """按类型粗筛记忆候选。"""
+        rows: list[dict[str, Any]] = []
+        with self._lock:
+            conn = self._require()
+            for memory_type in memory_types:
+                fetched = conn.execute(
+                    """
+                    SELECT * FROM memories
+                    WHERE session_id = ? AND type = ?
+                    ORDER BY importance DESC, created_at DESC LIMIT ?
+                    """,
+                    (session_id, memory_type, limit),
+                ).fetchall()
+                for row in fetched:
+                    data = self._row_to_dict(row)
+                    data["keywords"] = self._decode_keywords(row["keywords"])
+                    rows.append(data)
+        return rows
 
-        Args:
-            session_id: 会话键。
-            memory_types: 类型白名单。
-            limit: 每类上限（实现时按类型分组查询）。
-
-        Returns:
-            行字典列表（keywords 已反序列化为 list）。
-
-        TODO(v0.1): 每个类型一条 `ORDER BY importance DESC, created_at DESC LIMIT ?`；
-            JSON 解析失败时 keywords 置空，不能整行丢弃。
-        """
-        raise NotImplementedError("v0.1: Store.fetch_memories")
-
-    def mark_recalled(self, memory_ids: Sequence[int], *, at: float | None = None) -> None:
-        """更新召回时间与次数。
-
-        Args:
-            memory_ids: 主键列表。
-            at: 召回时间；None 取当前。
-
-        Returns:
-            None。
-
-        TODO(v0.1): `UPDATE ... SET last_recalled_at=?, recall_count=recall_count+1`；
-            空列表直接返回。
-        """
-        raise NotImplementedError("v0.1: Store.mark_recalled")
+    def mark_recalled(
+        self, memory_ids: Sequence[int], *, at: float | None = None
+    ) -> None:
+        """更新召回时间与次数。"""
+        ids = [int(memory_id) for memory_id in memory_ids]
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            conn = self._require()
+            conn.execute(
+                f"""
+                UPDATE memories
+                SET last_recalled_at = ?, recall_count = recall_count + 1
+                WHERE id IN ({placeholders})
+                """,
+                (self._now() if at is None else float(at), *ids),
+            )
+            conn.commit()
 
     def adjust_importance(self, memory_id: int, delta: float) -> None:
-        """调整重要度（裁剪到 [0,1]）。
-
-        Args:
-            memory_id: 主键。
-            delta: 增量。
-
-        Returns:
-            None。
-
-        TODO(v0.1): 用 `MAX(0.0, MIN(1.0, importance + ?))` 在 SQL 里夹取。
-        """
-        raise NotImplementedError("v0.1: Store.adjust_importance")
+        """调整重要度（裁剪到 [0,1]）。"""
+        with self._lock:
+            conn = self._require()
+            conn.execute(
+                """
+                UPDATE memories
+                SET importance = MAX(0.0, MIN(1.0, importance + ?))
+                WHERE id = ?
+                """,
+                (float(delta), int(memory_id)),
+            )
+            conn.commit()
 
     def mark_corrected(self, memory_id: int) -> None:
-        """记录一次用户纠正（降权依据）。
+        """记录一次用户纠正：计数 +1、重要度 -0.1。"""
+        with self._lock:
+            conn = self._require()
+            conn.execute(
+                """
+                UPDATE memories
+                SET corrected_count = corrected_count + 1,
+                    importance = MAX(0.0, importance - 0.1)
+                WHERE id = ?
+                """,
+                (int(memory_id),),
+            )
+            conn.commit()
 
-        Args:
-            memory_id: 主键。
+    def delete_memory(self, memory_id: int) -> bool:
+        """删除一条记忆。"""
+        with self._lock:
+            conn = self._require()
+            cursor = conn.execute("DELETE FROM memories WHERE id = ?", (int(memory_id),))
+            conn.commit()
+        return bool(cursor.rowcount)
 
-        Returns:
-            None。
-
-        TODO(v0.1): `corrected_count += 1`，同时把 importance 减 0.1（下限 0）。
-        """
-        raise NotImplementedError("v0.1: Store.mark_corrected")
+    def update_memory_content(self, memory_id: int, content: str) -> None:
+        """人工修正记忆正文。"""
+        with self._lock:
+            conn = self._require()
+            conn.execute(
+                "UPDATE memories SET content = ? WHERE id = ?",
+                (content, int(memory_id)),
+            )
+            conn.commit()
 
     # ------------------------------------------------------------------ relationship
     def load_relationship(self, session_id: str) -> dict[str, Any] | None:
-        """读取关系状态行。
-
-        Args:
-            session_id: 会话键。
-
-        Returns:
-            行字典（pending_promises 已解析）；无记录返回 None。
-
-        TODO(v0.1): JSON 解析失败时 pending_promises 置 [] 并记 WARN。
-        """
-        raise NotImplementedError("v0.1: Store.load_relationship")
+        """读取关系状态行。"""
+        with self._lock:
+            row = self._require().execute(
+                "SELECT * FROM relationship_state WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        data = self._row_to_dict(row)
+        data["pending_promises"] = loads(row["pending_promises"], [])
+        return data
 
     def save_relationship(
         self,
@@ -385,20 +450,29 @@ class Store:
         tension: float,
         pending_promises: Sequence[dict[str, Any]],
     ) -> None:
-        """写入关系状态（UPSERT）。
-
-        Args:
-            session_id: 会话键。
-            intimacy: 0..1。
-            tension: 0..1。
-            pending_promises: 未完成事项列表（存 JSON）。
-
-        Returns:
-            None。
-
-        TODO(v0.1): 夹取取值范围；`updated_at=time.time()`。
-        """
-        raise NotImplementedError("v0.1: Store.save_relationship")
+        """写入关系状态（UPSERT）。"""
+        with self._lock:
+            conn = self._require()
+            conn.execute(
+                """
+                INSERT INTO relationship_state(
+                  session_id, intimacy, tension, pending_promises, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                  intimacy=excluded.intimacy,
+                  tension=excluded.tension,
+                  pending_promises=excluded.pending_promises,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    session_id,
+                    max(0.0, min(1.0, float(intimacy))),
+                    max(0.0, min(1.0, float(tension))),
+                    dumps(list(pending_promises)),
+                    self._now(),
+                ),
+            )
+            conn.commit()
 
     # ------------------------------------------------------------------ logs
     def insert_turn_log(
@@ -410,49 +484,49 @@ class Store:
         injected_tokens: int,
         dropped_json: str | None = None,
     ) -> None:
-        """写一轮决策日志。
-
-        Args:
-            turn_id: 轮次 ID。
-            session_id: 会话键。
-            decision_json: 决策 JSON（由 TurnDecision.to_dict 序列化）。
-            injected_tokens: 实际注入估算 Token。
-            dropped_json: 丢弃项 JSON。
-
-        Returns:
-            None。
-
-        TODO(v0.1): 主循环内不直接调用——经 Archiver 串行写；
-            或者接受"日志晚一拍"的代价，见设计文档 §5。
-        """
-        raise NotImplementedError("v0.1: Store.insert_turn_log")
+        """写一轮决策日志。"""
+        with self._lock:
+            conn = self._require()
+            conn.execute(
+                """
+                INSERT INTO turn_logs(
+                  turn_id, session_id, decision_json, injected_tokens,
+                  dropped_items, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    turn_id,
+                    session_id,
+                    decision_json,
+                    int(injected_tokens),
+                    dropped_json,
+                    self._now(),
+                ),
+            )
+            conn.commit()
 
     def get_turn_log(self, turn_id: str) -> dict[str, Any] | None:
-        """按 turn_id 取日志（`/ctm replay` 用）。
+        """按 turn_id 取日志。"""
+        with self._lock:
+            row = self._require().execute(
+                "SELECT * FROM turn_logs WHERE turn_id = ? ORDER BY id DESC LIMIT 1",
+                (turn_id,),
+            ).fetchone()
+        return self._row_to_dict(row) if row else None
 
-        Args:
-            turn_id: 轮次 ID。
-
-        Returns:
-            行字典；不存在返回 None。
-
-        TODO(v0.1): SELECT ... WHERE turn_id=? ORDER BY id DESC LIMIT 1。
-        """
-        raise NotImplementedError("v0.1: Store.get_turn_log")
-
-    def list_turn_logs(self, session_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
-        """列出会话最近的决策日志。
-
-        Args:
-            session_id: 会话键。
-            limit: 上限。
-
-        Returns:
-            行字典列表，按时间倒序。
-
-        TODO(v0.1): 索引 idx_turn_logs_session 覆盖该查询。
-        """
-        raise NotImplementedError("v0.1: Store.list_turn_logs")
+    def list_turn_logs(
+        self, session_id: str, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """列出会话最近的决策日志。"""
+        with self._lock:
+            rows = self._require().execute(
+                """
+                SELECT * FROM turn_logs WHERE session_id = ?
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def insert_archive_failure(
         self,
@@ -462,110 +536,87 @@ class Store:
         error: str,
         payload: str | None = None,
     ) -> None:
-        """记录归档最终失败。
-
-        Args:
-            turn_id: 轮次 ID（可空）。
-            stage: 失败阶段（summarize / assert / episode / relationship / log）。
-            error: 错误摘要。
-            payload: 原始数据（截断后存）。
-
-        Returns:
-            None。
-
-        TODO(v0.1): 截断 payload 到 8KB，避免单条失败撑爆库。
-        """
-        raise NotImplementedError("v0.1: Store.insert_archive_failure")
+        """记录归档最终失败（payload 截断到 8KB）。"""
+        with self._lock:
+            conn = self._require()
+            conn.execute(
+                """
+                INSERT INTO archive_failures(
+                  turn_id, stage, error, payload, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    turn_id,
+                    stage,
+                    error[:2000],
+                    (payload or "")[:8192],
+                    self._now(),
+                ),
+            )
+            conn.commit()
 
     def purge_turn_logs(self, older_than: float) -> int:
-        """清理过期决策日志。
-
-        Args:
-            older_than: 时间戳；早于它的记录被删除。
-
-        Returns:
-            删除行数。
-
-        TODO(v0.1): 每日维护任务调用；删除前先 checkpoint 视情况。
-        """
-        raise NotImplementedError("v0.1: Store.purge_turn_logs")
+        """清理过期决策日志，返回删除行数。"""
+        with self._lock:
+            conn = self._require()
+            cursor = conn.execute(
+                "DELETE FROM turn_logs WHERE created_at < ?", (float(older_than),)
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
 
     # ------------------------------------------------------------------ export
     def export_session(self, session_id: str) -> dict[str, Any]:
-        """导出单个会话的全部数据（JSON 可序列化）。
-
-        Args:
-            session_id: 会话键。
-
-        Returns:
-            含 topics / memories / relationship / turn_logs / session_state 的字典。
-
-        TODO(v0.1): 分表读取后组装；ID 保持原值（导入时映射见 v1.0 迁移工具）。
-        """
-        raise NotImplementedError("v0.1: Store.export_session")
+        """导出单个会话的全部数据。"""
+        with self._lock:
+            conn = self._require()
+            topics = [
+                self._row_to_dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM topics WHERE session_id = ? ORDER BY id", (session_id,)
+                ).fetchall()
+            ]
+            memories = []
+            for row in conn.execute(
+                "SELECT * FROM memories WHERE session_id = ? ORDER BY id", (session_id,)
+            ).fetchall():
+                data = self._row_to_dict(row)
+                data["keywords"] = self._decode_keywords(row["keywords"])
+                memories.append(data)
+            logs = [
+                self._row_to_dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM turn_logs WHERE session_id = ? ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            ]
+        return {
+            "session_id": session_id,
+            "session_state": self.load_session_state(session_id),
+            "topics": topics,
+            "memories": memories,
+            "relationship": self.load_relationship(session_id),
+            "turn_logs": logs,
+            "exported_at": self._now(),
+        }
 
     # ------------------------------------------------------------------ internals
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
-        """把 Row 转成 dict。
-
-        Args:
-            row: sqlite3.Row。
-
-        Returns:
-            dict 行。
-
-        TODO(v0.1): return dict(row)
-        """
-        raise NotImplementedError("v0.1: Store._row_to_dict")
+        """把 Row 转成 dict。"""
+        return dict(row)
 
     def _decode_keywords(self, raw: str | None) -> list[str]:
-        """解析 keywords 列。
-
-        Args:
-            raw: JSON 文本。
-
-        Returns:
-            关键词列表；解析失败返回 []。
-
-        TODO(v0.1): try json.loads 且校验 list[str]。
-        """
-        raise NotImplementedError("v0.1: Store._decode_keywords")
+        """解析 keywords 列。"""
+        value = loads(raw, [])
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str)]
 
     def _now(self) -> float:
-        """统一时间来源。
+        """统一时间来源。"""
+        return time.time()
 
-        Returns:
-            Unix 秒。
-
-        TODO(v0.1): return time.time()
-        """
-        raise NotImplementedError("v0.1: Store._now")
-
-
-def dumps(value: Any) -> str:
-    """紧凑 JSON 序列化（中文不转义）。
-
-    Args:
-        value: 任意可序列化对象。
-
-    Returns:
-        JSON 文本。
-
-    TODO(v0.1): json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    """
-    raise NotImplementedError("v0.1: dumps")
-
-
-def loads(text: str | None, default: Any) -> Any:
-    """容错 JSON 反序列化。
-
-    Args:
-        text: JSON 文本或 None。
-        default: 解析失败时的返回值。
-
-    Returns:
-        解析结果或 default。
-
-    TODO(v0.1): try/except (ValueError, TypeError)。
-    """
-    raise NotImplementedError("v0.1: loads")
+    def _require(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise sqlite3.Error("store is not initialized")
+        return self._conn

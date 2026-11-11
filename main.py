@@ -1,36 +1,14 @@
 """AstrBot 接线层：消息入口 → 联合决策 → 单次注入 → 异步归档。
 
-## 为什么 handler 是**模块级函数**而逻辑在实例方法里
-
-AstrBot 派发 handler 时调用的是 `handler(event, ...)` 绑定形式；但在部分环境
-（实测过 4.28.1 + webchat）注册进去的是**未绑定的类函数**，此时 `self` 是事件
-对象，任何 `self.xxx` 都抛 `AttributeError`，而派发层会 `stop_event()`，
-同一条消息后面的插件全部不执行。所以入口用"模块级函数 + 模块级单例"，
-业务逻辑仍然是实例方法，便于单测直接构造实例。
-
-## 每轮时序（设计文档 §5）
-
-```
-消息事件 ──▶ on_message       聚合（v0.1 占位）→ Perception → 决策 → set_extra
-          ──▶ on_llm_request  读取决策 → build（预算装箱）→ append system_prompt
-          ──▶ LLM
-          ──▶ on_llm_response 入队归档（不等结果）
-```
-
-四条不可违反的约定：
-
-1. 两个 handler 都**吞掉所有异常**（`CancelledError` 除外），绝不让异常外泄到
-   派发层——插件出错不能变成"用户消息没人回"；
-2. `on_llm_request` 只追加、不 return 阻断；硬切不在这一层执行；
-3. 决策通过 `event.set_extra("ctm_decision", ...)` 传递，缺失时**不注入**并记
-   `WARN_NO_DECISION`，而不是临时重算（重算会与消息入口的感知不一致）；
-4. 注入量默认不超过原 system_prompt 的 25%，超了截断并记
-   `WARN_PROMPT_GROWTH_CAPPED`。
+模块级 handler 通过模块级单例转发到插件实例，逻辑保留在实例方法里，便于单测。
+所有 hook 都吞掉异常（CancelledError 除外），插件出错不能变成"用户消息没人回"。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -38,54 +16,37 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.message import TextPart
 
 from .config import PLUGIN_NAME, Config, load_config
-from .ctm import adapters as adapters_mod
-from .ctm.archiver import Archiver
+from .ctm.archiver import ArchiveJob, Archiver
 from .ctm.cognition import Cognition, TurnDecision
 from .ctm.commands import CtmCommands
+from .ctm.enums import TopicAction
 from .ctm.injection import InjectionBuilder
+from .ctm.longterm.manager import LongTermMemory
+from .ctm.longterm.store import LongTermStore
 from .ctm.memory_store import MemoryStore
-from .ctm.observability import Diag
-from .ctm.perception import Perception, PerceptionSignal
+from .ctm.observability import Diag, LogCode, configure, log_event
+from .ctm.perception import Perception
 from .ctm.relationship import RelationshipManager
 from .ctm.store import Store
-from .ctm.topic_state import TopicState, TopicStateMachine
+from .ctm.topic_state import TopicStateMachine
 
 MESSAGE_PRIORITY = 1000
-"""消息入口优先级：插件层顶格，而不是"比别人高一点"。
-
-理由同 astrbot_plugin_msg_aggregator：1~100 是常规区间，1000 表示"处在插件层
-的顶层"。但优先级再高也只是"尽量先跑"——真正的兜底是 `on_llm_request`
-不依赖消息入口一定先执行：拿不到决策就不注入、并记 WARN。
-"""
-
 DECISION_EXTRA = "ctm_decision"
-"""事件上的决策键。同一事件对象贯穿"消息派发 → LLM 请求"，随事件回收。"""
 
 _INSTANCE: "CtmPlugin | None" = None
-"""模块级单例；`terminate()` 时置空，防止 handler 拿到半销毁实例。"""
 
 
 def _get_instance() -> "CtmPlugin | None":
-    """返回模块级单例。
-
-    Returns:
-        插件实例；尚未构造时返回 None（handler 会直接放行）。
-    """
+    """返回模块级单例；尚未构造时返回 None。"""
     return _INSTANCE
 
 
 @filter.event_message_type(filter.EventMessageType.ALL, priority=MESSAGE_PRIORITY)
 async def ctm_on_event(event: AstrMessageEvent) -> None:
-    """消息入口：感知、决策、挂决策；不阻断事件。
-
-    Args:
-        event: 消息事件。
-
-    Returns:
-        None。
-    """
+    """消息入口：感知、决策、挂决策；不阻断事件。"""
     plugin = _get_instance()
     if plugin is None:
         return
@@ -93,21 +54,13 @@ async def ctm_on_event(event: AstrMessageEvent) -> None:
         await plugin.on_message(event)
     except asyncio.CancelledError:
         raise
-    except Exception as exc:  # noqa: BLE001 - 绝不让异常外泄到派发层
+    except Exception as exc:  # noqa: BLE001
         logger.exception(f"[{PLUGIN_NAME}] 消息入口异常（已兜住）：{exc}")
 
 
 @filter.on_llm_request()
 async def ctm_on_llm_request(event: AstrMessageEvent, req: ProviderRequest) -> None:
-    """LLM 请求前：唯一注入点。
-
-    Args:
-        event: 消息事件。
-        req: 待发送的请求对象；只追加 `system_prompt`。
-
-    Returns:
-        None。**不 return 结果、不阻断请求**。
-    """
+    """LLM 请求前：唯一注入点。"""
     plugin = _get_instance()
     if plugin is None:
         return
@@ -121,15 +74,7 @@ async def ctm_on_llm_request(event: AstrMessageEvent, req: ProviderRequest) -> N
 
 @filter.on_llm_response()
 async def ctm_on_llm_response(event: AstrMessageEvent, response: LLMResponse) -> None:
-    """LLM 响应后：投递归档任务。
-
-    Args:
-        event: 消息事件。
-        response: 模型响应。
-
-    Returns:
-        None。
-    """
+    """LLM 响应后：投递归档任务。"""
     plugin = _get_instance()
     if plugin is None:
         return
@@ -143,14 +88,7 @@ async def ctm_on_llm_response(event: AstrMessageEvent, response: LLMResponse) ->
 
 @filter.command("ctm")
 async def ctm_command(event: AstrMessageEvent):
-    """`/ctm` 管理命令入口。
-
-    Args:
-        event: 消息事件。
-
-    Yields:
-        MessageEventResult：命令输出。
-    """
+    """`/ctm` 管理命令入口。"""
     plugin = _get_instance()
     if plugin is None:
         return
@@ -172,10 +110,8 @@ class CtmPlugin(Star):
         global _INSTANCE
         _INSTANCE = self
 
-        self._raw_config: dict[str, Any] = config if isinstance(config, dict) else {}
-        self.cfg: Config = load_config(config)  # TODO(v0.1) 实现后才有值
+        self.cfg: Config = load_config(config)
         self.diag = Diag()
-
         self.data_dir = Path(self._data_dir())
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -187,221 +123,436 @@ class CtmPlugin(Star):
         self.builder = InjectionBuilder(self.cfg)
         self.cognition = Cognition(self.cfg, self.builder, self.topic_sm)
         self.commands = CtmCommands(self)
-        self.archiver = Archiver(self.store, self.memory, self.relationship, self.cfg)
-        self.adapter: adapters_mod.MemoryAdapter | None = None
+        self.archiver = Archiver(
+            self.store, self.memory, self.relationship, self.cfg
+        )
+        self.lt: LongTermMemory | None = None
+        self._lt_store: LongTermStore | None = None
         self._started = False
-
+        self._pending_old_topic: dict[str, int | None] = {}
+        self._pending_emotion: dict[str, float] = {}
+        self._pending_sticky: dict[str, bool] = {}
         logger.info(f"[{PLUGIN_NAME}] 实例已构造 | 数据目录={self.data_dir}")
 
     # ------------------------------------------------------------------ 生命周期
     async def initialize(self) -> None:
-        """插件加载：建库、选适配器、起归档 worker。
-
-        Returns:
-            None。
-
-        TODO(v0.1):
-            1. `store.init()`；失败时记 ERROR 并把 `enabled` 降级为 False；
-            2. `adapter = adapters.create_adapter(...)`；
-            3. `archiver.start()`；
-            4. 打印生效配置（脱敏）；
-            5. 探测重复注入（`_detect_duplicate_injection`）。
-        """
+        """插件加载：建库、起归档 worker、起长期记忆 worker。"""
+        if not self.cfg.enabled:
+            logger.info(f"[{PLUGIN_NAME}] 配置未启用，插件不工作。")
+            return
+        configure(self._emit_log)
+        try:
+            self.store.init()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[{PLUGIN_NAME}] 数据库初始化失败：{exc}")
+            return
+        try:
+            self.archiver.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[{PLUGIN_NAME}] 归档 worker 启动失败：{exc}")
+        if self.cfg.longterm.enabled:
+            try:
+                self._lt_store = LongTermStore(self._resolve_db_path())
+                self._lt_store.init()
+                self.lt = LongTermMemory(
+                    self._lt_store,
+                    self.cfg.longterm,
+                    self._get_provider,
+                )
+                await self.lt.start()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[{PLUGIN_NAME}] 长期记忆初始化失败：{exc}")
+                self.lt = None
         self._started = True
-        logger.info(f"[{PLUGIN_NAME}] initialize（v0.1 骨架：装配逻辑待实现）")
+        logger.info(
+            f"[{PLUGIN_NAME}] 已启动 | db={self._resolve_db_path()} | "
+            f"longterm={'on' if self.lt else 'off'}"
+        )
 
     async def terminate(self) -> None:
-        """插件卸载：flush 归档、checkpoint、关连接。
-
-        Returns:
-            None。
-
-        TODO(v0.1): `archiver.stop(5.0)` → `store.checkpoint()` → `store.close()`；
-            `_INSTANCE = None`（防止 handler 拿到半销毁实例）。
-        """
+        """插件卸载：flush 归档、checkpoint、关连接。"""
+        global _INSTANCE
         self._started = False
-        logger.info(f"[{PLUGIN_NAME}] terminate（v0.1 骨架：收尾逻辑待实现）")
+        try:
+            await self.archiver.stop(5.0)
+        except Exception:  # noqa: BLE001
+            pass
+        if self.lt is not None:
+            try:
+                await self.lt.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._lt_store is not None:
+            self._lt_store.close()
+        try:
+            self.store.checkpoint()
+            self.store.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _INSTANCE = None
+        logger.info(f"[{PLUGIN_NAME}] 已卸载。")
 
     # ------------------------------------------------------------------ 消息入口
     async def on_message(self, event: AstrMessageEvent) -> None:
-        """处理一条消息：感知 → 召回 → 决策 → 挂到事件上。
+        """处理一条消息：感知 → 召回 → 决策 → 挂到事件上。"""
+        if not self.cfg.enabled:
+            return
+        signal = self.perception.extract(event)
+        if signal.is_command or not signal.text:
+            return
+        session_id = signal.session_id
+        state = self.topic_sm.load(session_id)
+        self.store.ensure_session(session_id, signal.user_id)
+        if not state.stack:
+            state = self._ensure_initial_topic(signal, state)
+        relationship = self.relationship.load(session_id)
+        candidates = self.memory.recall_candidates(signal, state)
+        old_topic = state.focus()
+        try:
+            decision = self.cognition.decide(signal, state, candidates, relationship)
+        except Exception as exc:  # noqa: BLE001
+            log_event(LogCode.STORE_ERROR, session_id=session_id, error=str(exc))
+            return
+        self._apply_topic_action(signal, state, decision, force_hard=False)
+        self._pending_old_topic[session_id] = (
+            old_topic.topic_id
+            if old_topic and decision.topic_action == TopicAction.SOFT_BOUNDARY
+            else None
+        )
+        self._pending_emotion[session_id] = signal.emotion_score
+        self._pending_sticky[session_id] = signal.sticky_hit
+        event.set_extra(DECISION_EXTRA, decision)
+        self.diag.turns += 1
+        self.diag.decisions += 1
+        self.diag.soft_switches += int(decision.topic_action == TopicAction.SOFT_BOUNDARY)
+        self.diag.hard_switches += int(decision.topic_action == TopicAction.HARD_SWITCH)
+        self.diag.recall_items += len(decision.recall_items)
+        self.diag.dropped_items += len(decision.dropped_items)
+        self.diag.injected_tokens += decision.estimated_tokens
+        log_event(
+            LogCode.DECISION,
+            session_id=session_id,
+            turn_id=decision.turn_id,
+            action=decision.topic_action.value,
+            persona=decision.persona_mode.value,
+            tokens=decision.estimated_tokens,
+        )
 
-        Args:
-            event: 消息事件。
+    async def on_llm_request(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """唯一注入点：常驻注入 CTM 决策块 + 长期记忆块。"""
+        if not self.cfg.enabled:
+            return
+        session_id = event.unified_msg_origin
+        await self._inject_longterm(event, req)
+        decision = event.get_extra(DECISION_EXTRA)
+        if decision is None:
+            if self.diag.decisions:
+                self.diag.no_decision += 1
+                log_event(LogCode.NO_DECISION, session_id=session_id)
+            return
+        if not isinstance(decision, TurnDecision):
+            return
+        try:
+            payload = self.builder.build(decision)
+            payload = self.builder.cap_by_ratio(
+                payload,
+                req.system_prompt or "",
+                self.cfg.injection.max_prompt_growth_ratio,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.diag.injection_errors += 1
+            log_event(LogCode.INJECTION_ERROR, session_id=session_id, error=str(exc))
+            return
+        if req.system_prompt:
+            req.system_prompt = f"{req.system_prompt}\n{payload}"
+        else:
+            req.system_prompt = payload
+        self.memory.mark_recalled([item.memory_id for item in decision.recall_items])
+        if decision.recall_items:
+            log_event(
+                LogCode.DROPPED,
+                session_id=session_id,
+                kept=len(decision.recall_items),
+                dropped=len(decision.dropped_items),
+            )
 
-        Returns:
-            None。
-
-        TODO(v0.1):
-            1. 聚合接入点：v0.1 逐条处理；接入聚合层后用合并文本构造信号
-               （注意不要与 msg_aggregator 同装，见 DESIGN.md §7）；
-            2. `signal.is_command` 直接放行（指令不参与判定）；
-            3. `topic_sm.load` → `memory.recall_candidates` → `relationship.load`；
-            4. `cognition.decide`；
-            5. `_apply_topic_action` 落地状态并保存；
-            6. `event.set_extra(DECISION_EXTRA, decision)`；
-            7. 累计 `diag` 并记 INFO_DECISION。
-        """
-        raise NotImplementedError("v0.1: CtmPlugin.on_message")
-
-    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
-        """唯一注入点。
-
-        Args:
-            event: 消息事件。
-            req: 请求对象。
-
-        Returns:
-            None。
-
-        TODO(v0.1):
-            1. 取 `event.get_extra(DECISION_EXTRA)`；缺失 → WARN_NO_DECISION + 返回；
-            2. `builder.build(decision)`；
-            3. `builder.cap_by_ratio(payload, req.system_prompt,
-               cfg.injection.max_prompt_growth_ratio)`；
-            4. 追加到 `req.system_prompt`（空串时直接赋值，避免开头空行）；
-            5. 记录注入量 / 丢弃项 / 决策日志；
-            6. `soft_boundary_once` 时清除 `soft_boundary_pending`；
-            7. 异常 → 只追加最小关系块，记 ERROR_INJECTION。
-        """
-        raise NotImplementedError("v0.1: CtmPlugin.on_llm_request")
-
-    async def on_llm_response(self, event: AstrMessageEvent, response: LLMResponse) -> None:
-        """响应后投递归档。
-
-        Args:
-            event: 消息事件。
-            response: 模型响应。
-
-        Returns:
-            None。
-
-        TODO(v0.1):
-            1. 取决策；缺失直接返回（这条消息不归 CTM 管）；
-            2. 组装 `ArchiveJob`（只放文本与快照，**不放 event 对象**）；
-            3. `await archiver.enqueue(job)`；队列满记 WARN_ARCHIVE_DROPPED；
-            4. `event.set_extra(DECISION_EXTRA, None)` 释放引用。
-        """
-        raise NotImplementedError("v0.1: CtmPlugin.on_llm_response")
+    async def on_llm_response(
+        self, event: AstrMessageEvent, response: LLMResponse
+    ) -> None:
+        """响应后投递归档；同时调度长期记忆抽取。"""
+        if not self.cfg.enabled:
+            return
+        session_id = event.unified_msg_origin
+        response_text = getattr(response, "completion_text", "") or ""
+        decision = event.get_extra(DECISION_EXTRA)
+        if isinstance(decision, TurnDecision):
+            job = ArchiveJob(
+                turn_id=decision.turn_id,
+                session_id=session_id,
+                user_text=event.message_str or "",
+                response_text=response_text,
+                topic_action=decision.topic_action.value,
+                persona_mode=decision.persona_mode.value,
+                emotional_salience=float(
+                    self._pending_emotion.pop(session_id, 0.0)
+                ),
+                sticky_hit=self._pending_sticky.pop(session_id, False),
+                occurred_at=time.time(),
+                old_topic_id=self._pending_old_topic.pop(session_id, None),
+                decision_json=json.dumps(decision.to_dict(), ensure_ascii=False),
+                injected_tokens=decision.estimated_tokens,
+                dropped_json=json.dumps(decision.dropped_items, ensure_ascii=False),
+            )
+            try:
+                if not await self.archiver.enqueue(job):
+                    log_event(LogCode.ARCHIVE_DROPPED, session_id=session_id)
+            except Exception:  # noqa: BLE001
+                pass
+            event.set_extra(DECISION_EXTRA, None)
+        self._observe_longterm(event, response_text)
 
     # ------------------------------------------------------------------ 状态落地
+    def _ensure_initial_topic(self, signal: Any, state: Any) -> Any:
+        """空栈会话的初始话题（否则永远不会触发软边界）。"""
+        try:
+            title = self.topic_sm.title_for(getattr(signal, "text", ""))
+            topic_id = self.store.create_topic(state.session_id, title)
+            from .ctm.topic_state import TopicNode
+
+            node = TopicNode(
+                topic_id=topic_id,
+                title=title,
+                created_at=time.time(),
+                last_active_at=time.time(),
+            )
+            state.stack.append(node)
+            state.current_topic = title
+            self.topic_sm.save(state)
+        except Exception as exc:  # noqa: BLE001
+            log_event(LogCode.STORE_ERROR, session_id=state.session_id, error=str(exc))
+        return state
+
     def _apply_topic_action(
         self,
-        signal: PerceptionSignal,
-        state: TopicState,
+        signal: Any,
+        state: Any,
         decision: TurnDecision,
         *,
         force_hard: bool = False,
-    ) -> TopicState:
-        """把决策里的话题动作落到状态机上并保存。
+    ) -> None:
+        """把决策里的话题动作落到状态机上并保存。"""
+        try:
+            if force_hard or decision.topic_action == TopicAction.HARD_SWITCH:
+                self.topic_sm.hard_switch(signal, state)
+                return
+            if decision.topic_action == TopicAction.SOFT_BOUNDARY:
+                title = self.topic_sm.title_for(signal.text)
+                self.topic_sm.soft_boundary(signal, state, title)
+                return
+            state.turns_since_switch += 1
+            focus = state.focus()
+            if focus is not None:
+                focus.last_active_at = time.time()
+                self.store.update_topic(
+                    focus.topic_id, last_active_at=focus.last_active_at
+                )
+            self.topic_sm.save(state)
+        except Exception as exc:  # noqa: BLE001
+            log_event(LogCode.STORE_ERROR, session_id=signal.session_id, error=str(exc))
 
-        Args:
-            signal: 感知信号。
-            state: 决策前状态。
-            decision: 决策。
-            force_hard: 显式硬切（来自命令）。
+    # ------------------------------------------------------------------ 长期记忆
+    async def _inject_longterm(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """召回长期记忆并作为临时内容块注入。"""
+        if self.lt is None:
+            return
+        group_id = str(event.get_group_id() or "")
+        try:
+            text = await self.lt.recall(
+                session_id=event.unified_msg_origin,
+                platform_id=event.get_platform_id(),
+                sender_id=event.get_sender_id(),
+                group_id=group_id,
+                is_group=bool(group_id),
+                query=(req.prompt or event.message_str or "").strip(),
+            )
+        except Exception:  # noqa: BLE001
+            return
+        if not text:
+            return
+        try:
+            part = TextPart(text=text).mark_as_temp()
+            if req.extra_user_content_parts is None:
+                req.extra_user_content_parts = []
+            req.extra_user_content_parts.append(part)
+        except Exception:  # noqa: BLE001
+            req.system_prompt = f"{req.system_prompt or ''}\n{text}"
 
-        Returns:
-            新状态。
+    def _observe_longterm(self, event: AstrMessageEvent, response_text: str) -> None:
+        if self.lt is None:
+            return
+        try:
+            self.lt.observe_turn(
+                session_id=event.unified_msg_origin,
+                platform_id=event.get_platform_id(),
+                sender_id=event.get_sender_id(),
+                group_id=str(event.get_group_id() or ""),
+                is_group=bool(event.get_group_id()),
+                user_text=event.message_str or "",
+                assistant_text=response_text,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
-        TODO(v0.1):
-            * soft_boundary → `topic_sm.soft_boundary(signal, state, title_for(text))`；
-            * hard_switch 且 force_hard → `topic_sm.hard_switch(...)`；
-            * 其他 → `turns_since_switch += 1`（每轮 +1），更新栈顶 last_active_at；
-            * 统一 `topic_sm.save(new_state)`（一次事务，避免半更新）。
-        """
-        raise NotImplementedError("v0.1: CtmPlugin._apply_topic_action")
+    async def _get_provider(self, session_id: str) -> Any:
+        """解析 chat provider（兼容 4.26 的同步接口与 4.29 的异步接口）。"""
+        provider_id = self.cfg.longterm.extract_provider_id
+        try:
+            if provider_id:
+                manager = getattr(self.context, "provider_manager", None)
+                if manager is not None:
+                    provider = await manager.get_provider_by_id(provider_id)
+                    if provider is not None:
+                        return provider
+            getter = getattr(self.context, "get_using_provider_async", None)
+            if callable(getter):
+                return await getter(session_id)
+            return self.context.get_using_provider(session_id)
+        except Exception:  # noqa: BLE001
+            return None
 
     # ------------------------------------------------------------------ 命令
     async def on_command(self, event: AstrMessageEvent):
-        """执行 `/ctm` 子命令（仅管理员）。
-
-        Args:
-            event: 消息事件。
-
-        Yields:
-            MessageEventResult：命令输出。
-        """
+        """执行 `/ctm` 子命令（仅管理员）。"""
         if not event.is_admin():
             yield event.plain_result("此命令仅管理员可用。")
             return
         text = await self.commands.dispatch(event, event.message_str)
         yield event.plain_result(text)
 
+    # ------------------------------------------------------------------ LLM 工具
+    @filter.llm_tool(name="memory_search")
+    async def memory_search_tool(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        scope: str = "auto",
+        limit: int = 8,
+    ) -> str:
+        """检索长期记忆（用户画像、偏好、约定、事件）。
+
+        Args:
+            query(string): 检索关键词或短句
+            scope(string): auto / user / group
+            limit(number): 返回条数 1-20
+        """
+        if self.lt is None or not self.cfg.longterm.tools_enabled:
+            return "长期记忆未启用。"
+        rows = self.lt.search(
+            session_id=event.unified_msg_origin,
+            platform_id=event.get_platform_id(),
+            sender_id=event.get_sender_id(),
+            group_id=str(event.get_group_id() or ""),
+            is_group=bool(event.get_group_id()),
+            query=query,
+            scope=scope,
+            limit=limit,
+        )
+        if not rows:
+            return "没有找到相关记忆。"
+        return "\n".join(
+            f"- [{row['kind']}] {row['content']} (id:{str(row['id'])[:8]})"
+            for row in rows
+        )
+
+    @filter.llm_tool(name="memory_save")
+    async def memory_save_tool(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        kind: str = "fact",
+        slot_key: str = "",
+    ) -> str:
+        """保存一条长期记忆（仅当用户明确要求记住，或信息稳定且长期有用）。
+
+        Args:
+            content(string): 一句自包含陈述（<=80 字）
+            kind(string): profile / preference / event / task / fact
+            slot_key(string): 可选槽位，如 name / city
+        """
+        if self.lt is None or not self.cfg.longterm.tools_enabled:
+            return "长期记忆未启用。"
+        item = self.lt.save(
+            session_id=event.unified_msg_origin,
+            platform_id=event.get_platform_id(),
+            sender_id=event.get_sender_id(),
+            group_id=str(event.get_group_id() or ""),
+            is_group=bool(event.get_group_id()),
+            content=content,
+            kind=kind,
+            slot_key=slot_key,
+        )
+        if item is None:
+            return "记忆被拒绝（空、重复或敏感内容）。"
+        return f"已记住（id:{str(item['id'])[:8]}）。"
+
+    @filter.llm_tool(name="memory_forget")
+    async def memory_forget_tool(
+        self,
+        event: AstrMessageEvent,
+        memory_id: str = "",
+        query: str = "",
+    ) -> str:
+        """删除长期记忆（用户要求遗忘或纠正错误信息时）。
+
+        Args:
+            memory_id(string): memory_search 返回的 id 前缀或完整 id
+            query(string): 按内容包含匹配删除
+        """
+        if self.lt is None or not self.cfg.longterm.tools_enabled:
+            return "长期记忆未启用。"
+        deleted = self.lt.forget(
+            session_id=event.unified_msg_origin,
+            platform_id=event.get_platform_id(),
+            sender_id=event.get_sender_id(),
+            group_id=str(event.get_group_id() or ""),
+            is_group=bool(event.get_group_id()),
+            memory_id=memory_id,
+            query=query,
+        )
+        return f"已删除 {deleted} 条记忆。" if deleted else "没有找到匹配记忆。"
+
     # ------------------------------------------------------------------ 内部
     def _resolve_db_path(self) -> Path:
-        """把配置里的 db_path 解析成绝对路径。
-
-        Returns:
-            绝对路径；相对路径相对于插件数据目录（而不是 AstrBot 的 data 根），
-            这样备份/卸载边界清楚。
-
-        TODO(v0.1): 用 Path.is_absolute 判断；`..` 穿越时拒绝并回退默认文件名。
-        """
-        raise NotImplementedError("v0.1: CtmPlugin._resolve_db_path")
+        """把配置里的 db_path 解析成绝对路径（相对路径基于插件数据目录）。"""
+        raw = Path(self.cfg.db_path)
+        if raw.is_absolute():
+            return raw
+        candidate = (self.data_dir / raw).resolve()
+        if self.data_dir.resolve() not in candidate.parents and candidate != self.data_dir.resolve():
+            return self.data_dir / "ctm.sqlite3"
+        return candidate
 
     def _data_dir(self) -> str:
-        """插件数据目录。
-
-        Returns:
-            `data/plugin_data/astrbot_plugin_ctm`；取不到时回退 `~/.astrbot/data/plugin_data`。
-        """
+        """插件数据目录。"""
         try:
             from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
             base = Path(get_astrbot_plugin_data_path())
-        except Exception:  # noqa: BLE001 - 老版本/测试环境
+        except Exception:  # noqa: BLE001
             base = Path.home() / ".astrbot" / "data" / "plugin_data"
         return str(base / PLUGIN_NAME)
 
-    def _detect_duplicate_injection(self) -> None:
-        """探测已安装的同类记忆插件，提示关闭其自动注入。
-
-        Returns:
-            None。
-
-        TODO(v0.1): 遍历 `context.get_all_stars()`，命中已知记忆插件名时记
-            WARN_DUPLICATE_INJECTION（只告警，不擅自改别人的配置）。
-        """
-        raise NotImplementedError("v0.1: CtmPlugin._detect_duplicate_injection")
-
-    def _clear_soft_boundary(self, session_id: str) -> None:
-        """清除"边界提示待注入"标记。
-
-        Args:
-            session_id: 会话键。
-
-        Returns:
-            None。
-
-        TODO(v0.1): 读 - 改 - 写 session_state；失败只记日志。
-        """
-        raise NotImplementedError("v0.1: CtmPlugin._clear_soft_boundary")
-
-    def _minimal_relationship_line(self, decision: TurnDecision) -> str:
-        """注入失败时的最小兜底文本。
-
-        Args:
-            decision: 决策（可能带关系快照）。
-
-        Returns:
-            单行关系摘要；`relationship` 为空时返回空串（宁可不注入，也不编造）。
-
-        TODO(v0.1): 用 relationship.intimacy/tension 生成一行；不要带记忆正文。
-        """
-        raise NotImplementedError("v0.1: CtmPlugin._minimal_relationship_line")
-
-    def _persist_turn_log(self, decision: TurnDecision, injected_tokens: int) -> None:
-        """记录本轮决策日志。
-
-        Args:
-            decision: 决策。
-            injected_tokens: 实际注入估算。
-
-        Returns:
-            None。
-
-        TODO(v0.1): 经 Archiver 串行写（避免事件循环里做 IO）；
-            在此之前进 `turn_logs` 允许晚一拍，但 turn_id 必须稳定。
-        """
-        raise NotImplementedError("v0.1: CtmPlugin._persist_turn_log")
+    def _emit_log(self, level: str, fields: dict[str, Any]) -> None:
+        """把结构化日志转给 AstrBot logger。"""
+        payload = " ".join(f"{key}={value}" for key, value in fields.items())
+        message = f"[{PLUGIN_NAME}] {payload}"
+        if level == "ERROR":
+            logger.error(message)
+        elif level == "WARNING":
+            logger.warning(message)
+        else:
+            logger.info(message)

@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
+
+from .ctm.longterm.config import LongTermConfig
 
 PLUGIN_NAME = "astrbot_plugin_ctm"
 
@@ -89,8 +91,7 @@ class Weights:
         Returns:
             四项权重之和；用于归一化与配置校验。
         """
-        # TODO(v0.2): 实现 sum；load_config 校验时调用，和不为 1 时归一化并记 WARN。
-        raise NotImplementedError("v0.2: Weights.total")
+        return self.relevance + self.salience + self.recency + self.usage
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,62 @@ class Config:
     adapter: AdapterConfig = field(default_factory=AdapterConfig)
     injection: InjectionConfig = field(default_factory=InjectionConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
+    longterm: LongTermConfig = field(default_factory=LongTermConfig)
+
+
+def _group(raw: dict[str, Any], name: str) -> dict[str, Any]:
+    """取一个配置分组，缺失或类型错误时返回空 dict。"""
+    value = raw.get(name)
+    return value if isinstance(value, dict) else {}
+
+
+def _bool(group: dict[str, Any], key: str, default: bool) -> bool:
+    value = group.get(key)
+    return value if isinstance(value, bool) else default
+
+
+def _int(group: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    value = group.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return max(low, min(high, int(value)))
+
+
+def _float(
+    group: dict[str, Any], key: str, default: float, low: float, high: float
+) -> float:
+    value = group.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return max(low, min(high, float(value)))
+
+
+def _str(group: dict[str, Any], key: str, default: str) -> str:
+    value = group.get(key)
+    return value.strip() if isinstance(value, str) else default
+
+
+def _str_list(
+    group: dict[str, Any], key: str, default: tuple[str, ...]
+) -> tuple[str, ...]:
+    value = group.get(key)
+    if not isinstance(value, list):
+        return default
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _normalize_weights(weights: Weights) -> Weights:
+    """把权重归一化到和为 1；全 0 时回退默认。"""
+    total = weights.total()
+    if abs(total - 1.0) < 1e-6 or total <= 0:
+        return weights
+    return replace(
+        weights,
+        relevance=weights.relevance / total,
+        salience=weights.salience / total,
+        recency=weights.recency / total,
+        usage=weights.usage / total,
+    )
 
 
 def load_config(raw: dict[str, Any] | None) -> Config:
@@ -231,4 +288,185 @@ def load_config(raw: dict[str, Any] | None) -> Config:
         4. `auto_switch_strategy` 不在 {off, soft, hard} 时回退 soft；
         5. 返回不可变 `Config` 快照。
     """
-    raise NotImplementedError("v0.1: load_config（解析 + 校验 + 失败回退）")
+    raw = raw if isinstance(raw, dict) else {}
+    basic = _group(raw, "basic")
+    topic_raw = _group(raw, "topic")
+    memory_raw = _group(raw, "memory")
+    relationship_raw = _group(raw, "relationship")
+    adapter_raw = _group(raw, "adapter")
+    injection_raw = _group(raw, "injection")
+    observability_raw = _group(raw, "observability")
+
+    defaults = Config()
+    strategy = _str(topic_raw, "auto_switch_strategy", STRATEGY_SOFT)
+    if strategy not in (STRATEGY_OFF, STRATEGY_SOFT, STRATEGY_HARD):
+        strategy = STRATEGY_SOFT
+
+    weights = _normalize_weights(
+        Weights(
+            relevance=_float(memory_raw, "w_relevance", 0.45, 0.0, 1.0),
+            salience=_float(memory_raw, "w_salience", 0.35, 0.0, 1.0),
+            recency=_float(memory_raw, "w_recency", 0.15, 0.0, 1.0),
+            usage=_float(memory_raw, "w_usage", 0.05, 0.0, 1.0),
+        )
+    )
+
+    backend = _str(adapter_raw, "backend", BACKEND_SQLITE)
+    if backend not in (
+        BACKEND_SQLITE,
+        BACKEND_LIVING_MEMORY,
+        BACKEND_MEMORY_COMPANION,
+    ):
+        backend = BACKEND_SQLITE
+
+    return Config(
+        enabled=_bool(basic, "enabled", defaults.enabled),
+        db_path=_str(basic, "db_path", defaults.db_path) or defaults.db_path,
+        timezone=_str(basic, "timezone", defaults.timezone) or defaults.timezone,
+        topic=TopicConfig(
+            auto_switch_enabled=_bool(
+                topic_raw, "auto_switch_enabled", defaults.topic.auto_switch_enabled
+            ),
+            auto_switch_strategy=strategy,
+            topic_threshold=_float(
+                topic_raw, "topic_threshold", defaults.topic.topic_threshold, 0.0, 1.0
+            ),
+            min_turns_before_switch=_int(
+                topic_raw,
+                "min_turns_before_switch",
+                defaults.topic.min_turns_before_switch,
+                1,
+                100,
+            ),
+            switch_cooldown_seconds=_int(
+                topic_raw,
+                "switch_cooldown_seconds",
+                defaults.topic.switch_cooldown_seconds,
+                0,
+                86400,
+            ),
+            preserve_recent_topics=_int(
+                topic_raw,
+                "preserve_recent_topics",
+                defaults.topic.preserve_recent_topics,
+                0,
+                20,
+            ),
+            sticky_keywords=_str_list(
+                topic_raw, "sticky_keywords", defaults.topic.sticky_keywords
+            ),
+            sticky_regex=_str_list(
+                topic_raw, "sticky_regex", defaults.topic.sticky_regex
+            ),
+            new_intent_markers=_str_list(
+                topic_raw, "new_intent_markers", defaults.topic.new_intent_markers
+            ),
+        ),
+        memory=MemoryConfig(
+            injection_budget_tokens=_int(
+                memory_raw,
+                "injection_budget_tokens",
+                defaults.memory.injection_budget_tokens,
+                100,
+                8000,
+            ),
+            summary_limit=_int(
+                memory_raw, "summary_limit", defaults.memory.summary_limit, 0, 20
+            ),
+            assertion_limit=_int(
+                memory_raw, "assertion_limit", defaults.memory.assertion_limit, 0, 20
+            ),
+            episode_limit=_int(
+                memory_raw, "episode_limit", defaults.memory.episode_limit, 0, 20
+            ),
+            recency_half_life_days=_float(
+                memory_raw,
+                "recency_half_life_days",
+                defaults.memory.recency_half_life_days,
+                1.0,
+                3650.0,
+            ),
+            weights=weights,
+            assertion_confidence_threshold=_float(
+                memory_raw,
+                "assertion_confidence_threshold",
+                defaults.memory.assertion_confidence_threshold,
+                0.0,
+                1.0,
+            ),
+            episode_salience_threshold=_float(
+                memory_raw,
+                "episode_salience_threshold",
+                defaults.memory.episode_salience_threshold,
+                0.0,
+                1.0,
+            ),
+        ),
+        relationship=RelationshipConfig(
+            enabled=_bool(
+                relationship_raw, "enabled", defaults.relationship.enabled
+            ),
+            intimacy_decay_per_day=_float(
+                relationship_raw,
+                "intimacy_decay_per_day",
+                defaults.relationship.intimacy_decay_per_day,
+                0.0,
+                1.0,
+            ),
+            tension_decay_per_turn=_float(
+                relationship_raw,
+                "tension_decay_per_turn",
+                defaults.relationship.tension_decay_per_turn,
+                0.0,
+                1.0,
+            ),
+            promise_detection_enabled=_bool(
+                relationship_raw,
+                "promise_detection_enabled",
+                defaults.relationship.promise_detection_enabled,
+            ),
+        ),
+        adapter=AdapterConfig(
+            backend=backend,
+            fallback_sqlite=_bool(
+                adapter_raw, "fallback_sqlite", defaults.adapter.fallback_sqlite
+            ),
+            fallback_markdown=_bool(
+                adapter_raw, "fallback_markdown", defaults.adapter.fallback_markdown
+            ),
+        ),
+        injection=InjectionConfig(
+            include_meta=_bool(
+                injection_raw, "include_meta", defaults.injection.include_meta
+            ),
+            soft_boundary_once=_bool(
+                injection_raw,
+                "soft_boundary_once",
+                defaults.injection.soft_boundary_once,
+            ),
+            max_prompt_growth_ratio=_float(
+                injection_raw,
+                "max_prompt_growth_ratio",
+                defaults.injection.max_prompt_growth_ratio,
+                0.0,
+                1.0,
+            ),
+        ),
+        observability=ObservabilityConfig(
+            log_decisions=_bool(
+                observability_raw, "log_decisions", defaults.observability.log_decisions
+            ),
+            log_dropped_items=_bool(
+                observability_raw,
+                "log_dropped_items",
+                defaults.observability.log_dropped_items,
+            ),
+            log_level=_str(
+                observability_raw, "log_level", defaults.observability.log_level
+            ),
+            log_redact=_bool(
+                observability_raw, "log_redact", defaults.observability.log_redact
+            ),
+        ),
+        longterm=LongTermConfig.from_dict(_group(raw, "longterm")),
+    )

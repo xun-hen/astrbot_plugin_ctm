@@ -26,6 +26,174 @@
       }
     }
   },
+  "longterm": {
+    "description": "长期记忆（跨会话）",
+    "type": "object",
+    "hint": "跨会话记住用户与群聊的稳定事实。写入在回复后异步抽取，读取在请求前注入；与上方的短期「记忆与预算」互不影响。",
+    "obvious_hint": true,
+    "items": {
+      "enabled": {
+        "description": "启用长期记忆",
+        "type": "bool",
+        "default": true,
+        "hint": "总开关；关闭后不抽取、不注入、不响应记忆工具。"
+      },
+      "extract": {
+        "description": "抽取设置（写路径）",
+        "type": "object",
+        "items": {
+          "enabled": {
+            "description": "自动抽取",
+            "type": "bool",
+            "default": true,
+            "hint": "每 N 轮调用一次对话模型抽取稳定事实，会产生额外 token 消耗。"
+          },
+          "every_n_turns": {
+            "description": "抽取间隔（轮）",
+            "type": "int",
+            "default": 2,
+            "hint": "每多少轮对话抽取一次。"
+          },
+          "min_chars": {
+            "description": "最小文本长度",
+            "type": "int",
+            "default": 8,
+            "hint": "user+assistant 少于该字符数不抽取。"
+          },
+          "max_calls_per_hour": {
+            "description": "每小时抽取上限",
+            "type": "int",
+            "default": 30,
+            "hint": "每个会话每小时最多调用多少次模型，0 表示禁用自动抽取。"
+          },
+          "confidence_threshold": {
+            "description": "入库置信度阈值",
+            "type": "float",
+            "default": 0.55
+          },
+          "promote_threshold": {
+            "description": "直接转正阈值",
+            "type": "float",
+            "default": 0.72,
+            "hint": "低于该置信度先记为候选，再次出现才转正（抗幻觉）。"
+          },
+          "provider_id": {
+            "description": "抽取模型提供商 ID",
+            "type": "string",
+            "default": "",
+            "hint": "留空沿用当前会话模型；可指定更便宜的模型。"
+          },
+          "max_candidates": {
+            "description": "单次最大候选数",
+            "type": "int",
+            "default": 5
+          }
+        }
+      },
+      "recall": {
+        "description": "召回设置（读路径）",
+        "type": "object",
+        "items": {
+          "enabled": {
+            "description": "召回并注入",
+            "type": "bool",
+            "default": true
+          },
+          "max_items": {
+            "description": "注入条数上限",
+            "type": "int",
+            "default": 12
+          },
+          "max_profile_items": {
+            "description": "常驻画像条数上限",
+            "type": "int",
+            "default": 5
+          },
+          "max_tokens": {
+            "description": "注入 Token 预算",
+            "type": "int",
+            "default": 800
+          },
+          "min_score": {
+            "description": "最低召回分",
+            "type": "float",
+            "default": 0.28
+          },
+          "timeout_ms": {
+            "description": "召回超时（毫秒）",
+            "type": "int",
+            "default": 800,
+            "hint": "超时即放弃注入并继续正常回复。"
+          },
+          "half_life_days": {
+            "description": "新近度半衰期（天）",
+            "type": "float",
+            "default": 30.0
+          },
+          "inject_profile": {
+            "description": "常驻注入画像",
+            "type": "bool",
+            "default": true
+          },
+          "include_group_scope": {
+            "description": "群聊读取群记忆",
+            "type": "bool",
+            "default": true
+          },
+          "w_lexical": {
+            "description": "词面相关权重",
+            "type": "float",
+            "default": 0.45
+          },
+          "w_importance": {
+            "description": "重要度权重",
+            "type": "float",
+            "default": 0.35
+          },
+          "w_recency": {
+            "description": "新近度权重",
+            "type": "float",
+            "default": 0.2
+          }
+        }
+      },
+      "tools": {
+        "description": "记忆工具",
+        "type": "object",
+        "items": {
+          "enabled": {
+            "description": "启用记忆工具",
+            "type": "bool",
+            "default": true,
+            "hint": "向模型挂载 memory_search / memory_save / memory_forget。"
+          }
+        }
+      },
+      "privacy": {
+        "description": "隐私与容量",
+        "type": "object",
+        "items": {
+          "block_sensitive": {
+            "description": "过滤敏感信息",
+            "type": "bool",
+            "default": true,
+            "hint": "拒绝保存密码、密钥、证件号、银行卡号。"
+          },
+          "max_items_per_scope": {
+            "description": "单作用域条数上限",
+            "type": "int",
+            "default": 300
+          },
+          "retention_days": {
+            "description": "保留天数",
+            "type": "int",
+            "default": 0,
+            "hint": "0 表示永久保留。"
+          }
+        }
+      }
+    }
+  },
   "topic": {
     "description": "话题状态机",
     "type": "object",

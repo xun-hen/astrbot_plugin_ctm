@@ -1,16 +1,6 @@
-"""文本相似度：话题判定与记忆相关性共用的打分栈。
+"""文本相似度：话题判定与记忆相关性共用的打分栈（纯标准库）。
 
-设计文档 §3.2 要求三级实现，优先级从高到低：
-
-1. 配置了 Embedding Provider → 余弦相似度；
-2. 否则 → 关键词 Jaccard + 字符 n-gram 加权；
-3. 兜底 → 标题与消息的包含关系。
-
-本模块只定义契约与词法实现。Embedding 是 v1.0 的事，但**接口现在就留好**：
-上层只依赖 `SimilarityScorer.score()`，将来换实现不改判定代码。
-
-注意：中文没有空格，Jaccard 的"词"在这里指 **2-gram 字符片段**加英文单词，
-不引入分词器（避免第三方依赖，也避免分词差异带来的不可复现）。
+中文按「单字 + 2-gram」近似，英文按词；不引入分词器，保证可复现。
 """
 
 from __future__ import annotations
@@ -18,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Protocol
 
-_WORD_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
 
 
 class SimilarityScorer(Protocol):
@@ -44,11 +34,14 @@ def tokenize(text: str) -> set[str]:
         text: 任意文本。
 
     Returns:
-        小写英文词 + 单字 + 单字 2-gram 的并集（中文用 2-gram 近似"词"）。
-
-    TODO(v0.1): 去标点/空白，保留数字；英文按词，中文按字与 bigram。
+        小写英文词、单字与中文 2-gram 的并集。
     """
-    raise NotImplementedError("v0.1: tokenize")
+    tokens = {match.lower() for match in _TOKEN_RE.findall(text or "")}
+    cjk_runs = re.findall(r"[\u4e00-\u9fff]+", text or "")
+    for run in cjk_runs:
+        for index in range(len(run) - 1):
+            tokens.add(run[index : index + 2])
+    return tokens
 
 
 def jaccard(left: set[str], right: set[str]) -> float:
@@ -60,14 +53,14 @@ def jaccard(left: set[str], right: set[str]) -> float:
 
     Returns:
         |A∩B| / |A∪B|；任一为空返回 0.0。
-
-    TODO(v0.1): 空集短路，避免除零。
     """
-    raise NotImplementedError("v0.1: jaccard")
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
 
 
 def char_ngram_similarity(left: str, right: str, n: int = 2) -> float:
-    """字符 n-gram 相似度（中文短文本比 Jaccard 更稳）。
+    """字符 n-gram 相似度。
 
     Args:
         left: 文本 A。
@@ -76,14 +69,24 @@ def char_ngram_similarity(left: str, right: str, n: int = 2) -> float:
 
     Returns:
         两组 n-gram 的 Jaccard；文本短于 n 时退化为字符集合比较。
-
-    TODO(v0.1): 去掉空白后切片，空串返回 0.0。
     """
-    raise NotImplementedError("v0.1: char_ngram_similarity")
+    left_clean = re.sub(r"\s+", "", left or "")
+    right_clean = re.sub(r"\s+", "", right or "")
+    if not left_clean or not right_clean:
+        return 0.0
+    if len(left_clean) < n or len(right_clean) < n:
+        return jaccard(set(left_clean), set(right_clean))
+    left_grams = {left_clean[i : i + n] for i in range(len(left_clean) - n + 1)}
+    right_grams = {right_clean[i : i + n] for i in range(len(right_clean) - n + 1)}
+    return jaccard(left_grams, right_grams)
 
 
-def topic_similarity(topic_text: str, message_text: str, scorer: SimilarityScorer | None = None) -> float:
-    """话题相似度的统一入口（按文档的三级策略）。
+def topic_similarity(
+    topic_text: str,
+    message_text: str,
+    scorer: SimilarityScorer | None = None,
+) -> float:
+    """话题相似度的统一入口。
 
     Args:
         topic_text: 当前话题文本。
@@ -92,16 +95,19 @@ def topic_similarity(topic_text: str, message_text: str, scorer: SimilarityScore
 
     Returns:
         0..1 相似度。
-
-    TODO(v0.1): 依次尝试 scorer → 词法加权（0.6×Jaccard + 0.4×2-gram）→ 包含关系。
     """
-    raise NotImplementedError("v0.1: topic_similarity")
+    topic_text = topic_text or ""
+    message_text = message_text or ""
+    if not topic_text.strip() or not message_text.strip():
+        return 0.0
+    if scorer is not None:
+        return max(0.0, min(1.0, scorer.score(topic_text, message_text)))
+    return LexicalScorer().score(topic_text, message_text)
 
 
 class LexicalScorer:
     """无外部依赖的默认打分器（Jaccard + 字符 2-gram 加权）。"""
 
-    #: Jaccard 的权重；剩余给字符 n-gram。数值待回归对比后定稿。
     JACCARD_WEIGHT = 0.6
 
     def score(self, topic_text: str, message_text: str) -> float:
@@ -113,7 +119,9 @@ class LexicalScorer:
 
         Returns:
             `0.6 * jaccard + 0.4 * char_ngram_similarity`，裁剪到 [0, 1]。
-
-        TODO(v0.1): 实现加权；topic_text 为空时返回 0.0（视为新会话）。
         """
-        raise NotImplementedError("v0.1: LexicalScorer.score")
+        if not (topic_text or "").strip():
+            return 0.0
+        jac = jaccard(tokenize(topic_text), tokenize(message_text))
+        ngram = char_ngram_similarity(topic_text, message_text)
+        return max(0.0, min(1.0, self.JACCARD_WEIGHT * jac + (1 - self.JACCARD_WEIGHT) * ngram))

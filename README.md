@@ -1,96 +1,109 @@
 # 对话认知中枢（Cognitive Turn Manager）
 
-> **状态：v0.1 骨架**。模块边界、接口签名、DDL、配置与失败码已定稿；
-> 判定/召回/注入/归档的**逻辑体全部留空**（`raise NotImplementedError`），
-> 按 `docs/DESIGN.md` 的里程碑填实现即可。
+> **状态：v0.2（可运行）**。长期记忆（跨会话抽取 / 召回 / 管理）、话题软边界、
+> 关系状态与异步归档已实现；`on_message → on_llm_request → on_llm_response`
+> 全链路可用，默认配置即可工作，核心零第三方依赖。
 
 CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决策点：每轮只产出
-一次 `TurnDecision`，只在 `on_llm_request` 注入一次，归档异步执行。
+一次 `TurnDecision`，只在 `on_llm_request` 注入一次，归档在后台单 worker 执行。
 它替代"多个记忆插件各注入一段 Prompt、互相看不见对方"的做法。
 
-## 能力（目标态）
+## 能力
 
 | 能力 | 说明 |
 | --- | --- |
+| 长期记忆 | 跨会话记住用户/群聊的稳定事实；回复后异步抽取，请求前按预算召回 |
+| 作用域隔离 | `user = platform:sender`、`group = platform:group`，群聊可同时读两者，成员之间互不串号 |
 | 软话题边界 | 换话题只压栈、不清空上下文；回溯旧话题时弹栈自然衔接 |
-| 记忆包 | 话题摘要 / 用户断言 / 情节记忆，按 Token 预算装箱注入 |
+| 短期记忆包 | 话题摘要 / 用户断言 / 情节记忆，按 Token 预算装箱注入 |
 | 关系状态 | 亲密度、张力、未完成事项；慢变量，小幅更新 + 自然衰减 |
 | 人格模式 | daily / comfort / playful / serious，由情绪、张力与粘性命中决定 |
-| 单点注入 | 全插件只有 `on_llm_request` 改 `system_prompt`，注入量有上限 |
+| 单点注入 | 全插件只在 `on_llm_request` 追加一次，注入量有上限、有日志 |
 | 异步归档 | 单 worker 串行写 SQLite，失败重试并落 `archive_failures` |
-| 可回退 | `auto_switch_strategy=hard` 回到旧行为；`enabled=false` 完全停用 |
+| 可管理 | `/ctm` 命令 + `memory_search / memory_save / memory_forget` 工具 |
+| 可回退 | `basic.enabled=false` 完全停用；长期记忆可单独关闭 |
 
 ## 安装
 
-1. 将本目录放到 `data/plugins/astrbot_plugin_ctm/`；
+1. 将本目录放到 `data/plugins/astrbot_plugin_ctm/`（插件市场安装同名插件亦可）；
 2. 重启 AstrBot 或在面板中重载；
 3. 首次加载会在 `data/plugin_data/astrbot_plugin_ctm/` 下建 `ctm.sqlite3`。
 
-要求 AstrBot `>= 4.26`，Python 3.10+，核心零第三方依赖。
+要求 AstrBot `>= 4.26`，Python 3.10+。
 
 ## 配置要点
 
-默认配置即可用。三个最常调的项：
+默认配置即可用。最常调的几项：
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `topic.auto_switch_strategy` | `soft` | `off` 只判定不动作；`soft` 压栈；`hard` 等价 `/new`（默认不推荐） |
-| `memory.injection_budget_tokens` | `1000` | 每轮注入预算；超了按优先级丢，并记录 dropped |
+| `longterm.enabled` | `true` | 长期记忆总开关 |
+| `longterm.extract.every_n_turns` | `2` | 每多少轮抽取一次；成本主要旋钮 |
+| `longterm.extract.max_calls_per_hour` | `30` | 每会话每小时抽取上限 |
+| `longterm.recall.max_tokens` | `800` | 长期记忆注入预算 |
+| `longterm.recall.timeout_ms` | `800` | 召回硬超时，超时即跳过注入 |
+| `memory.injection_budget_tokens` | `1000` | CTM 短期记忆包注入预算 |
 | `injection.max_prompt_growth_ratio` | `0.25` | 注入不超过原 system_prompt 的 25% |
+| `topic.auto_switch_strategy` | `soft` | `off` 只判定不动作；`soft` 压栈（推荐） |
+| `basic.enabled` | `true` | 插件总开关 |
 
-**不要**与 `astrbot_plugin_msg_aggregator` 同装（CTM 自带聚合层，优先级同为
-1000，两者会互相抢消息）。若同时启用其他记忆插件的"自动注入"，请关掉它，
-否则会重复注入（CTM 会记 `WARN_DUPLICATE_INJECTION`）。
+敏感内容（密码、密钥、证件号、银行卡号）默认拒绝写入长期记忆。
 
-## 命令
+## 命令（仅管理员）
 
 ```
-/ctm status              当前会话话题栈、关系状态、预算
+/ctm status              当前会话话题栈、关系状态、预算、长期记忆统计
 /ctm topics              最近话题及摘要
-/ctm memory list [type]  记忆列表
+/ctm memory list [type]  短期记忆列表（summary/assertion/episode）
 /ctm memory edit <id> <content>  修正记忆（降权 + corrected_count）
-/ctm memory delete <id>  删除记忆
+/ctm memory delete <id>  删除短期记忆
 /ctm memory pin <id>     提高重要度
-/ctm switch hard         显式硬切换
-/ctm export              导出本会话数据
+/ctm longterm list       长期记忆列表
+/ctm longterm delete <id前缀>  删除长期记忆
+/ctm switch hard         显式硬切换（等价 /new）
+/ctm export              导出本会话数据到插件数据目录
 /ctm replay <turn_id>    回放某轮决策
-/ctm health              适配器 / DB / 队列健康检查
+/ctm health              DB / 归档队列 / 长期记忆健康检查
 ```
 
-命令仅管理员可用；`export` 在群聊默认拒绝。
+## 数据与隐私
 
-## 开发
+- 数据默认落在 `data/plugin_data/astrbot_plugin_ctm/ctm.sqlite3`，WAL 模式；
+- 长期记忆只存抽取后的陈述，不存原始对话全文（会话摘要除外）；
+- 每条记忆可定位、可删除，写入与删除都记 `lt_audit`；
+- 群聊作用域与用户作用域分离；删除按 id 时会校验当前事件可读作用域。
 
-- 架构、不变量、失败码、里程碑与测试矩阵：[docs/DESIGN.md](docs/DESIGN.md)
-- 测试计划：[tests/README.md](tests/README.md)
-- 配置默认值与 `_conf_schema.json` **必须逐项一致**（有测试锁死）。
+## 架构
+
+```
+main.py                 AstrBot 接线（hook / 生命周期 / 工具）
+config.py               强类型配置（与 _conf_schema.json 对齐）
+ctm/
+├── perception.py       规则感知（无 IO，P99 < 5ms）
+├── textsim.py          词法相似度（Jaccard + 字符 2-gram）
+├── topic_state.py      话题栈 / 软边界 / 弹栈 / 硬切
+├── memory_store.py     短期记忆候选召回与打分
+├── relationship.py     关系状态
+├── cognition.py        联合决策 TurnDecision
+├── injection.py        Token 预算装箱 + 模板渲染
+├── archiver.py         异步归档（单 worker + 重试）
+├── store.py            唯一 SQLite 入口
+├── commands.py         /ctm 子命令
+├── observability.py    日志码与诊断计数
+└── longterm/           长期记忆（config/store/retriever/extractor/manager）
+```
+
+## 开发与测试
 
 ```bash
-# 仅静态检查（骨架阶段）
-python -m compileall astrbot_plugin_ctm
-python -m json.tool astrbot_plugin_ctm/_conf_schema.json > /dev/null
+python -m compileall .
+python -m json.tool _conf_schema.json > /dev/null
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
-## 目录
+`tests/` 不加载 AstrBot：`ctm/*` 与 `ctm/longterm/*` 均为纯标准库，事件对象用
+最小替身；`main.py` 的 AstrBot 接线只做导入级 smoke。
 
-```
-astrbot_plugin_ctm/
-├── main.py            AstrBot 接线（hook / 生命周期 / 单例）
-├── config.py          强类型配置（与 _conf_schema.json 对齐）
-├── _conf_schema.json  面板配置 schema
-├── ctm/               核心包（不 import astrbot，可单测）
-│   ├── perception.py  规则感知（<5ms）
-│   ├── topic_state.py 话题栈 / 软边界 / 弹栈 / 硬切
-│   ├── memory_store.py 候选召回与打分
-│   ├── relationship.py 关系状态
-│   ├── cognition.py   联合决策
-│   ├── injection.py   预算装箱 + 模板渲染
-│   ├── archiver.py    异步归档（单 worker 串行写）
-│   ├── store.py       唯一 SQLite 入口
-│   ├── adapters/      sqlite / living_memory / memory_companion
-│   ├── commands.py    /ctm 子命令
-│   ├── observability.py 日志码 + 诊断计数
-│   └── sql/001_init.sql DDL
-├── docs/DESIGN.md     技术与落地设计
-└── tests/             测试计划（待实现）
-```
+## 许可
+
+AGPL-3.0-or-later，与 AstrBot 保持一致。

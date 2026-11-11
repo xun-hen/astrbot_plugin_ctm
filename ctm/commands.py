@@ -1,19 +1,13 @@
-"""`/ctm` 管理命令：只做查看与人工修正，不参与每轮热路径。
-
-设计文档 §7 的命令表。两条原则：
-
-* **读命令必须便宜**：`status` / `topics` / `memory list` 只查索引覆盖的列，
-  不做全表扫；群聊里被误触发时不至于拖慢回复；
-* **写命令必须留痕**：`memory edit` / `pin` / `delete` 都是一次纠正，
-  要写 `corrected_count` 或重要度，并记日志，否则"人工修正"会变成静默改库。
-
-权限：建议只给管理员（`event.is_admin()`）。v0.1 在外层用
-`@filter.permission_type(PermissionType.ADMIN)` 兜底，本模块不重复判断。
-"""
+"""`/ctm` 管理命令：只做查看与人工修正，不参与每轮热路径。"""
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
+
+from .injection import InjectionBuilder
+from .observability import LogCode, log_event
 
 USAGE = """CTM 管理命令：
 /ctm status              当前会话话题栈、关系状态、预算
@@ -22,7 +16,9 @@ USAGE = """CTM 管理命令：
 /ctm memory edit <id> <content>  修正记忆（降权 + 记录 corrected_count）
 /ctm memory delete <id>  删除记忆
 /ctm memory pin <id>     置顶（提高重要度）
-/ctm switch hard         显式硬切换（等价 /new，仅非陪伴场景）
+/ctm longterm list       列出长期记忆
+/ctm longterm delete <id> 删除长期记忆
+/ctm switch hard         显式硬切换（等价 /new，仅非紧急场景）
 /ctm export              导出本会话 JSON
 /ctm replay <turn_id>    回放某轮决策与注入内容
 /ctm health              适配器 / DB / 队列健康检查
@@ -36,123 +32,224 @@ class CtmCommands:
         """初始化。
 
         Args:
-            plugin: 插件实例；按 duck typing 使用 `cfg / store / memory /
-                relationship / topic_sm / diag / adapter / archiver`。
+            plugin: 插件实例（duck typing 使用其公开属性）。
         """
         self._plugin = plugin
 
     async def dispatch(self, event: Any, raw: str) -> str:
-        """解析并执行子命令。
-
-        Args:
-            event: 消息事件（用于拿 session_id 与权限）。
-            raw: 指令原文（含 `/ctm` 前缀）。
-
-        Returns:
-            要回复给用户的文本；未知子命令返回 USAGE。
-
-        TODO(v0.1): 去掉前缀后按空白切分；`memory` 二级子命令单独分派；
-            未知参数返回一行提示而不是整段 USAGE（避免刷屏）。
-        """
-        raise NotImplementedError("v0.1: CtmCommands.dispatch")
+        """解析并执行子命令。"""
+        parts = (raw or "").strip().split()
+        if parts and parts[0].startswith("/"):
+            parts = parts[1:]
+        if parts and parts[0] == "ctm":
+            parts = parts[1:]
+        if not parts:
+            return USAGE
+        command, args = parts[0], parts[1:]
+        if command == "status":
+            return await self.status(event, args)
+        if command == "topics":
+            return await self.topics(event, args)
+        if command == "memory":
+            return await self.memory(event, args)
+        if command == "longterm":
+            return await self.longterm(event, args)
+        if command == "switch":
+            return await self.switch_hard(event, args)
+        if command == "export":
+            return await self.export(event, args)
+        if command == "replay":
+            return await self.replay(event, args)
+        if command == "health":
+            return await self.health(event, args)
+        return USAGE
 
     async def status(self, event: Any, args: list[str]) -> str:
-        """`/ctm status`：话题栈 + 关系 + 预算使用。
-
-        Args:
-            event: 消息事件。
-            args: 额外参数（忽略）。
-
-        Returns:
-            多行文本。
-
-        TODO(v0.1): 读 session_state + topic_stack + relationship；
-            输出当前话题、栈深、turns_since_switch、intimacy/tension、
-            最近一次注入 Token 与丢弃条数。
-        """
-        raise NotImplementedError("v0.1: CtmCommands.status")
+        """`/ctm status`：话题栈 + 关系 + 预算使用。"""
+        plugin = self._plugin
+        session_id = str(getattr(event, "unified_msg_origin", ""))
+        state = plugin.topic_sm.load(session_id)
+        relationship = plugin.relationship.load(session_id)
+        diag = plugin.diag.as_dict()
+        lines = [
+            f"话题：{state.current_topic or '（无）'}",
+            f"栈深：{len(state.stack)}  turns_since_switch={state.turns_since_switch}",
+            f"亲密度：{relationship.intimacy:.2f}  张力：{relationship.tension:.2f}",
+            f"预算：{plugin.cfg.memory.injection_budget_tokens} tokens",
+            f"当前注入：{diag['injected_tokens']} tokens / 丢弃 {diag['dropped_items']} 条",
+            f"长期记忆：{plugin.lt.stats()['items']} 条" if plugin.lt else "长期记忆：未启用",
+            f"诊断：{json.dumps(diag, ensure_ascii=False)}",
+        ]
+        return "\n".join(lines)
 
     async def topics(self, event: Any, args: list[str]) -> str:
-        """`/ctm topics`：最近话题列表。
-
-        Args:
-            event: 消息事件。
-            args: 可选条数。
-
-        Returns:
-            列表文本（标题 + 状态 + 摘要首行）。
-
-        TODO(v0.1): store.list_topics(limit=args or 10)。
-        """
-        raise NotImplementedError("v0.1: CtmCommands.topics")
+        """`/ctm topics`：最近话题列表。"""
+        limit = _int_arg(args, 10)
+        session_id = str(getattr(event, "unified_msg_origin", ""))
+        rows = self._plugin.store.list_topics(session_id, limit=limit)
+        if not rows:
+            return "（无话题记录）"
+        lines = []
+        for row in rows:
+            summary = str(row.get("summary") or "").splitlines()
+            first = summary[0][:40] if summary else ""
+            lines.append(
+                f"#{row['id']} [{row['status']}] {row['title']}"
+                + (f" — {first}" if first else "")
+            )
+        return "\n".join(lines)
 
     async def memory(self, event: Any, args: list[str]) -> str:
-        """`/ctm memory ...`：记忆子命令入口。
+        """`/ctm memory ...`：CTM 短期记忆子命令。"""
+        if not args:
+            return "用法：/ctm memory list|edit|delete|pin ..."
+        action, rest = args[0], args[1:]
+        session_id = str(getattr(event, "unified_msg_origin", ""))
+        if action == "list":
+            memory_type = rest[0] if rest else ""
+            types = [memory_type] if memory_type else [
+                "summary",
+                "assertion",
+                "episode",
+            ]
+            rows = self._plugin.store.fetch_memories(session_id, types, limit=10)
+            if not rows:
+                return "（无记忆）"
+            return "\n".join(
+                f"#{row['id']} [{row['type']}] {str(row['content'])[:80]}"
+                for row in rows
+            )
+        if action in {"edit", "delete", "pin"} and len(rest) >= 1:
+            try:
+                memory_id = int(rest[0])
+            except ValueError:
+                return "记忆 ID 必须是整数。"
+            if action == "delete":
+                deleted = self._plugin.store.delete_memory(memory_id)
+                return "已删除。" if deleted else "未找到该记忆。"
+            if action == "pin":
+                self._plugin.store.adjust_importance(memory_id, 0.2)
+                return "已提高重要度。"
+            content = " ".join(rest[1:]).strip()
+            if not content:
+                return "用法：/ctm memory edit <id> <content>"
+            self._plugin.store.mark_corrected(memory_id)
+            self._plugin.store.update_memory_content(memory_id, content)
+            log_event(LogCode.DECISION, session_id=session_id, action="memory_edit")
+            return "已修正并降权。"
+        return "用法：/ctm memory list|edit|delete|pin ..."
 
-        Args:
-            event: 消息事件。
-            args: 形如 ["list", "assertion"] 或 ["edit", "12", "内容"]。
-
-        Returns:
-            文本结果。
-
-        TODO(v0.1): 二级分派到 list/edit/delete/pin；缺参时给单行用法。
-        """
-        raise NotImplementedError("v0.1: CtmCommands.memory")
+    async def longterm(self, event: Any, args: list[str]) -> str:
+        """`/ctm longterm ...`：长期记忆子命令。"""
+        plugin = self._plugin
+        if plugin.lt is None:
+            return "长期记忆未启用。"
+        platform_id = _platform_id(event)
+        sender_id = _sender_id(event)
+        group_id = str(getattr(event, "get_group_id", lambda: "")() or "")
+        is_group = bool(group_id)
+        session_id = str(getattr(event, "unified_msg_origin", ""))
+        action = args[0] if args else "list"
+        if action == "list":
+            rows = plugin.lt.store.list_scope(
+                "user", f"{platform_id}:{sender_id}", statuses=("active",), limit=20
+            )
+            if not rows:
+                return "（无长期记忆）"
+            return "\n".join(
+                f"{row['id'][:8]} [{row['kind']}] {str(row['content'])[:80]}"
+                for row in rows
+            )
+        if action == "delete" and len(args) >= 2:
+            prefix = args[1]
+            rows = plugin.lt.store.list_scope(
+                "user", f"{platform_id}:{sender_id}", statuses=("active",), limit=100
+            )
+            for row in rows:
+                if str(row["id"]).startswith(prefix):
+                    deleted = plugin.lt.forget(
+                        session_id=session_id,
+                        platform_id=platform_id,
+                        sender_id=sender_id,
+                        group_id=group_id,
+                        is_group=is_group,
+                        memory_id=str(row["id"]),
+                    )
+                    return "已删除。" if deleted else "未找到该记忆。"
+            return "未找到该记忆。"
+        return "用法：/ctm longterm list|delete <id前缀>"
 
     async def switch_hard(self, event: Any, args: list[str]) -> str:
-        """`/ctm switch hard`：显式硬切。
-
-        Args:
-            event: 消息事件。
-            args: 忽略。
-
-        Returns:
-            结果文本。
-
-        TODO(v0.1): 调 topic_sm.hard_switch 并保存；记 WARN 级日志（这是破坏性操作）。
-        """
-        raise NotImplementedError("v0.1: CtmCommands.switch_hard")
+        """`/ctm switch hard`：显式硬切。"""
+        if not args or args[0] != "hard":
+            return "用法：/ctm switch hard"
+        session_id = str(getattr(event, "unified_msg_origin", ""))
+        signal = self._plugin.perception.extract(event)
+        state = self._plugin.topic_sm.load(session_id)
+        self._plugin.topic_sm.hard_switch(signal, state)
+        log_event(LogCode.DECISION, session_id=session_id, action="hard_switch")
+        return "已硬切换（旧话题已归档）。"
 
     async def export(self, event: Any, args: list[str]) -> str:
-        """`/ctm export`：导出会话 JSON。
-
-        Args:
-            event: 消息事件。
-            args: 忽略。
-
-        Returns:
-            导出文件路径或"已发送文件"提示。
-
-        TODO(v0.1): store.export_session → 写插件数据目录 exports/，返回路径；
-            群聊场景默认拒绝（隐私），只允许私聊或管理员。
-        """
-        raise NotImplementedError("v0.1: CtmCommands.export")
+        """`/ctm export`：导出会话 JSON 到插件数据目录。"""
+        session_id = str(getattr(event, "unified_msg_origin", ""))
+        is_admin = bool(getattr(event, "is_admin", lambda: False)())
+        is_private = not bool(getattr(event, "get_group_id", lambda: "")() or "")
+        if not is_private and not is_admin:
+            return "群聊中导出数据需管理员权限。"
+        data = self._plugin.store.export_session(session_id)
+        export_dir = Path(self._plugin.data_dir) / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = session_id.replace(":", "_").replace("/", "_")[-60:]
+        path = export_dir / f"{safe_name}.json"
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return f"已导出到：{path}"
 
     async def replay(self, event: Any, args: list[str]) -> str:
-        """`/ctm replay <turn_id>`：回放决策。
-
-        Args:
-            event: 消息事件。
-            args: turn_id。
-
-        Returns:
-            决策摘要（不含记忆正文原文，避免二次泄露）。
-
-        TODO(v0.1): store.get_turn_log；格式化 topic_action / persona / tokens。
-        """
-        raise NotImplementedError("v0.1: CtmCommands.replay")
+        """`/ctm replay <turn_id>`：回放决策。"""
+        if not args:
+            return "用法：/ctm replay <turn_id>"
+        log = self._plugin.store.get_turn_log(args[0])
+        if not log:
+            return "未找到该轮次。"
+        decision = log.get("decision_json") or "{}"
+        try:
+            parsed = json.loads(decision)
+        except ValueError:
+            parsed = {}
+        return (
+            f"turn={log.get('turn_id')}\n"
+            f"action={parsed.get('topic_action')} persona={parsed.get('persona_mode')}\n"
+            f"tokens={log.get('injected_tokens')} dropped={log.get('dropped_items')}"
+        )
 
     async def health(self, event: Any, args: list[str]) -> str:
-        """`/ctm health`：DB / 适配器 / 队列健康。
+        """`/ctm health`：DB / 队列健康。"""
+        plugin = self._plugin
+        store_health = plugin.store.health()
+        lines = [
+            f"store: {'ok' if store_health.get('ok') else 'error'} "
+            f"{store_health.get('path', '')}",
+            f"archive queue: {plugin.archiver._queue.qsize()}",  # noqa: SLF001
+            f"longterm: {'ok' if plugin.lt is not None else 'off'}",
+        ]
+        return "\n".join(lines)
 
-        Args:
-            event: 消息事件。
-            args: 忽略。
 
-        Returns:
-            检查结果文本。
+def _int_arg(args: list[str], default: int) -> int:
+    if not args:
+        return default
+    try:
+        return max(1, min(100, int(args[0])))
+    except ValueError:
+        return default
 
-        TODO(v0.1): store.health() + adapter.health() + archiver 队列长度。
-        """
-        raise NotImplementedError("v0.1: CtmCommands.health")
+
+def _platform_id(event: Any) -> str:
+    getter = getattr(event, "get_platform_id", None)
+    return str(getter() or "") if callable(getter) else ""
+
+
+def _sender_id(event: Any) -> str:
+    getter = getattr(event, "get_sender_id", None)
+    return str(getter() or "") if callable(getter) else ""
