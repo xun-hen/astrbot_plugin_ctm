@@ -106,6 +106,10 @@ class ConfigTest(unittest.TestCase):
         )
         self.assertAlmostEqual(cfg.memory.weights.total(), 1.0, places=6)
         for key in (
+            "mode",
+            "auto_threshold",
+            "debug_mode",
+            "new_conversation_notice",
             "aggregation_enabled",
             "aggregation_debounce_seconds",
             "judge_enabled",

@@ -12,6 +12,7 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 
 | 能力 | 说明 |
 | --- | --- |
+| 运行模式 | `off / mark / hint / auto`：只记录、只提示、或置信度达标时自动新建对话（等价 `/new`） |
 | 消息聚合 | 同一会话/同一发送者的连发消息先合并成一轮，再判定、只回一次 |
 | 话题判定 | 启发式（相似度/承接词/换话题词/时间间隔）优先，拿不准时问一次便宜模型；失败一律按延续 |
 | 长期记忆 | 跨会话记住用户/群聊的稳定事实；回复后异步抽取，请求前按预算召回 |
@@ -43,6 +44,10 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 | `topic.aggregation_enabled` | `true` | 连发消息合并（默认 2s 防抖，总等待上限 12s） |
 | `topic.judge_enabled` | `true` | 话题判定；`judge_provider_id` 留空沿用当前模型 |
 | `topic.judge_max_checks_per_hour` | `30` | 每会话每小时模型判定上限 |
+| `topic.mode` | `hint` | 运行模式：`off` 不判定 / `mark` 只记录 / `hint` 判定并注入 / `auto` 自动新建对话 |
+| `topic.auto_threshold` | `0.8` | `auto` 模式切换对话所需置信度 |
+| `topic.debug_mode` | `false` | 空跑：判定照常但不注入、不切对话、不落状态 |
+| `topic.new_conversation_notice` | `false` | 自动切换时是否回一句提示 |
 | `longterm.enabled` | `true` | 长期记忆总开关 |
 | `longterm.extract.every_n_turns` | `2` | 每多少轮抽取一次；成本主要旋钮 |
 | `longterm.extract.max_calls_per_hour` | `30` | 每会话每小时抽取上限 |
@@ -60,6 +65,11 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 
 ```
 /ctm status              当前会话话题栈、关系状态、预算、长期记忆统计
+/ctm topic status        当前模式、本会话开关、话题与判定状态
+/ctm topic new [标题]    手动新建对话并开新话题（等价 /new）
+/ctm topic forget        忘记当前话题，下一条重新建档
+/ctm topic off|on        关闭/恢复本会话的自动话题判定
+/topicweave ...          与 /ctm ... 等价（别名，含"话题织机"）
 /ctm topics              最近话题及摘要
 /ctm memory list [type]  短期记忆列表（summary/assertion/episode）
 /ctm memory edit <id> <content>  修正记忆（降权 + corrected_count）
@@ -112,9 +122,11 @@ ctm/
 python -m compileall .
 python -m json.tool _conf_schema.json > /dev/null
 python -m unittest discover -s tests -p "test_*.py"
+python tests/eval_topic_detection.py --db ~/.astrbot/data/data_v4.db
 ```
 
-`tests/` 不加载 AstrBot：`ctm/*` 与 `ctm/longterm/*` 均为纯标准库，事件对象用
+`tests/eval_topic_detection.py` 用真实聊天记录跑启发式判定，输出混淆矩阵、
+精确率/召回率/F1 与模型调用占比（时间间隔代理真值）。`tests/` 不加载 AstrBot：`ctm/*` 与 `ctm/longterm/*` 均为纯标准库，事件对象用
 最小替身；`main.py` 的 AstrBot 接线只做导入级 smoke。
 
 ## 许可

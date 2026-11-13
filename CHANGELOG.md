@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## v0.4.0
+
+### 新增
+
+- 四种运行模式 `off / mark / hint / auto`（`ctm/modes.py`）：mark 只记录不注入；
+  auto 在置信度 ≥ `auto_threshold` 时调用 `conversation_manager.new_conversation`
+  自动新建对话（等价 `/new`），可选 `new_conversation_notice` 提示。
+- `debug_mode` 空跑：判定照常并记日志，但不注入、不切对话、不落话题状态。
+- 指令族：`/ctm topic status|new [标题]|forget|off|on`；新增 `/topicweave`（别名"话题织机"）。
+- 评测台 `tests/eval_topic_detection.py`：读 `platform_message_history`，
+  输出混淆矩阵、P/R/F1 与模型调用占比（时间间隔代理真值）。
+- 页面概览补充运行模式/自动切换阈值/调试状态。
+
 ## v0.3.1
 
 ### 新增

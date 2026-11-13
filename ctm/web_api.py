@@ -72,6 +72,10 @@ class PageApi:
             {
                 "enabled": cfg.enabled,
                 "topic": {
+                    "mode": cfg.topic.mode,
+                    "auto_threshold": cfg.topic.auto_threshold,
+                    "debug_mode": cfg.topic.debug_mode,
+                    "new_conversation_notice": cfg.topic.new_conversation_notice,
                     "strategy": cfg.topic.auto_switch_strategy,
                     "threshold": cfg.topic.topic_threshold,
                     "min_turns": cfg.topic.min_turns_before_switch,

@@ -67,6 +67,11 @@ class TopicConfig:
     )
     sticky_regex: tuple[str, ...] = ()
     new_intent_markers: tuple[str, ...] = ("另外", "话说", "换个话题", "对了", "突然想到")
+    # 运行模式：off / mark / hint / auto（见 ctm.modes）
+    mode: str = "hint"
+    auto_threshold: float = 0.8
+    debug_mode: bool = False
+    new_conversation_notice: bool = False
     # 消息聚合（连发合并成一轮）
     aggregation_enabled: bool = True
     aggregation_debounce_seconds: float = 2.0
@@ -261,6 +266,15 @@ def _float(
     return max(low, min(high, float(value)))
 
 
+def _mode(group: dict[str, Any], default: str) -> str:
+    """解析话题模式；非法值回退默认。"""
+    value = group.get("mode")
+    if not isinstance(value, str):
+        return default
+    value = value.strip().lower()
+    return value if value in ("off", "mark", "hint", "auto") else default
+
+
 def _str(group: dict[str, Any], key: str, default: str) -> str:
     value = group.get(key)
     return value.strip() if isinstance(value, str) else default
@@ -380,6 +394,22 @@ def load_config(raw: dict[str, Any] | None) -> Config:
             ),
             new_intent_markers=_str_list(
                 topic_raw, "new_intent_markers", defaults.topic.new_intent_markers
+            ),
+            mode=_mode(topic_raw, defaults.topic.mode),
+            auto_threshold=_float(
+                topic_raw,
+                "auto_threshold",
+                defaults.topic.auto_threshold,
+                0.0,
+                1.0,
+            ),
+            debug_mode=_bool(
+                topic_raw, "debug_mode", defaults.topic.debug_mode
+            ),
+            new_conversation_notice=_bool(
+                topic_raw,
+                "new_conversation_notice",
+                defaults.topic.new_conversation_notice,
             ),
             aggregation_enabled=_bool(
                 topic_raw,

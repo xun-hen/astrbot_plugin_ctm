@@ -112,6 +112,8 @@ function renderOverview(data) {
   const agg = data.aggregation || {};
   const budget = data.budget || {};
   fillDefinitionList(el.config, [
+    ["运行模式", `${topic.mode || "hint"}${topic.debug_mode ? "（调试空跑）" : ""}`],
+    ["自动切换阈值", String(topic.auto_threshold ?? "–") + (topic.new_conversation_notice ? "（切换时提示）" : "")],
     ["话题策略", `${topic.strategy}（阈值 ${topic.threshold}，最少 ${topic.min_turns} 轮，冷却 ${topic.cooldown_seconds}s）`],
     ["话题判定", topic.judge_enabled
       ? `开启；模型：${topic.judge_provider_id}；新话题门槛 ${topic.judge_min_confidence}；每小时上限 ${topic.judge_max_checks_per_hour}`

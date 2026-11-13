@@ -5,12 +5,12 @@
 | 项目 | 内容 |
 | --- | --- |
 | 插件 | `astrbot_plugin_ctm`（对话认知中枢 · 长期记忆） |
-| 版本 | `v0.3.1`（可运行；骨架期设计见 `docs/DESIGN.md`） |
+| 版本 | `v0.4.0`（可运行；骨架期设计见 `docs/DESIGN.md`） |
 | 仓库 | https://github.com/xun-hen/astrbot_plugin_ctm |
 | 分支 | `main`，交接基线 commit `beb87f2` |
 | 运行要求 | AstrBot `>= 4.26`，Python 3.10+，**核心零第三方依赖** |
 | 数据 | `data/plugin_data/astrbot_plugin_ctm/ctm.sqlite3`（WAL） |
-| 状态 | 消息聚合 / 双层话题判定 / 长期记忆 / 软边界 / 关系 / 归档 / 只读状态页均已实现并通过单测；未上架插件市场 |
+| 状态 | 四种模式 / 自动 /new / 消息聚合 / 双层判定 / 长期记忆 / 软边界 / 关系 / 归档 / 只读状态页均已实现并通过单测；未上架插件市场 |
 
 ---
 
@@ -206,6 +206,11 @@ WebUI 分组（`_conf_schema.json`）：`basic` / `longterm` / `topic` / `memory
 
 ```
 /ctm status                      话题栈、关系、预算、长期记忆统计
+/ctm topic status                模式、本会话开关、话题与判定状态
+/ctm topic new [标题]            手动新建对话并开新话题
+/ctm topic forget                忘记当前话题
+/ctm topic off|on                关闭/恢复本会话自动判定
+/topicweave ...                  与 /ctm ... 等价（别名）
 /ctm topics                      最近话题
 /ctm memory list [type]          短期记忆（summary/assertion/episode）
 /ctm memory edit <id> <content>  修正 + 降权

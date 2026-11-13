@@ -262,6 +262,32 @@
         "default": true,
         "hint": "把同一会话、同一发送者的连发消息合并成一轮，只触发一次判定和一次 LLM 调用。"
       },
+      "mode": {
+        "description": "运行模式",
+        "type": "string",
+        "default": "hint",
+        "options": ["off", "mark", "hint", "auto"],
+        "hint": "off=不判定；mark=只记录不注入；hint=判定并注入（推荐先观察）；auto=置信度达标时自动新建对话（等价 /new）。",
+        "obvious_hint": true
+      },
+      "auto_threshold": {
+        "description": "自动切换阈值",
+        "type": "float",
+        "default": 0.8,
+        "hint": "mode=auto 时，判定为新话题且置信度不低于该值才切换对话。"
+      },
+      "debug_mode": {
+        "description": "调试模式（空跑）",
+        "type": "bool",
+        "default": false,
+        "hint": "判定照常并记日志，但不注入、不切对话、不落话题状态。"
+      },
+      "new_conversation_notice": {
+        "description": "自动切换时提示用户",
+        "type": "bool",
+        "default": false,
+        "hint": "mode=auto 切换后回一句提示；默认静默。"
+      },
       "aggregation_debounce_seconds": {
         "description": "聚合防抖（秒）",
         "type": "float",

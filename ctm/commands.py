@@ -41,13 +41,15 @@ class CtmCommands:
         parts = (raw or "").strip().split()
         if parts and parts[0].startswith("/"):
             parts = parts[1:]
-        if parts and parts[0] == "ctm":
+        if parts and parts[0] in {"ctm", "topicweave", "话题织机"}:
             parts = parts[1:]
         if not parts:
             return USAGE
         command, args = parts[0], parts[1:]
         if command == "status":
             return await self.status(event, args)
+        if command == "topic":
+            return await self.topic(event, args)
         if command == "topics":
             return await self.topics(event, args)
         if command == "memory":
@@ -72,6 +74,8 @@ class CtmCommands:
         relationship = plugin.relationship.load(session_id)
         diag = plugin.diag.as_dict()
         lines = [
+            f"模式：{plugin.cfg.topic.mode}"
+            + ("（调试空跑）" if plugin.cfg.topic.debug_mode else ""),
             f"话题：{state.current_topic or '（无）'}",
             f"栈深：{len(state.stack)}  turns_since_switch={state.turns_since_switch}",
             f"亲密度：{relationship.intimacy:.2f}  张力：{relationship.tension:.2f}",
@@ -81,6 +85,42 @@ class CtmCommands:
             f"诊断：{json.dumps(diag, ensure_ascii=False)}",
         ]
         return "\n".join(lines)
+
+    async def topic(self, event: Any, args: list[str]) -> str:
+        """`/ctm topic ...`：模式与话题操作。"""
+        plugin = self._plugin
+        session_id = str(getattr(event, "unified_msg_origin", ""))
+        action = args[0] if args else "status"
+        if action == "status":
+            state = plugin.topic_sm.load(session_id)
+            disabled = session_id in plugin._topic_disabled  # noqa: SLF001
+            return "\n".join(
+                [
+                    f"模式：{plugin.cfg.topic.mode}"
+                    + ("（调试空跑）" if plugin.cfg.topic.debug_mode else ""),
+                    f"本会话：{'已关闭自动判定' if disabled else '启用'}",
+                    f"当前话题：{state.current_topic or '（无）'}  栈深：{len(state.stack)}",
+                    f"判定：{'开' if plugin.cfg.topic.judge_enabled else '关'}"
+                    f"，自动切换阈值 {plugin.cfg.topic.auto_threshold}",
+                    f"聚合：{'开' if plugin.cfg.topic.aggregation_enabled else '关'}"
+                    f"（防抖 {plugin.cfg.topic.aggregation_debounce_seconds}s）",
+                ]
+            )
+        if action == "new":
+            title = " ".join(args[1:]).strip()
+            return await plugin.manual_new_topic(event, title)
+        if action == "forget":
+            signal = plugin.perception.extract(event)
+            state = plugin.topic_sm.load(session_id)
+            plugin.topic_sm.hard_switch(signal, state)
+            return "已忘记当前话题，下一条消息将重新建档。"
+        if action in {"off", "on"}:
+            if action == "off":
+                plugin._topic_disabled.add(session_id)  # noqa: SLF001
+                return "本会话已关闭自动话题判定（长期记忆不受影响）。"
+            plugin._topic_disabled.discard(session_id)  # noqa: SLF001
+            return "本会话已恢复自动话题判定。"
+        return "用法：/ctm topic status|new [标题]|forget|off|on"
 
     async def topics(self, event: Any, args: list[str]) -> str:
         """`/ctm topics`：最近话题列表。"""

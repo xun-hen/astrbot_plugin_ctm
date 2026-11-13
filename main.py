@@ -26,6 +26,7 @@ from .ctm.cognition import Cognition, TurnDecision
 from .ctm.commands import CtmCommands
 from .ctm.enums import TopicAction
 from .ctm.injection import InjectionBuilder
+from .ctm import modes
 from .ctm.longterm.manager import LongTermMemory
 from .ctm.longterm.store import LongTermStore
 from .ctm.memory_store import MemoryStore
@@ -99,6 +100,16 @@ async def ctm_command(event: AstrMessageEvent):
         yield result
 
 
+@filter.command("topicweave", alias={"话题织机"})
+async def ctw_command(event: AstrMessageEvent):
+    """`/topicweave` 别名入口（与 `/ctm` 等价）。"""
+    plugin = _get_instance()
+    if plugin is None:
+        return
+    async for result in plugin.on_command(event):
+        yield result
+
+
 class CtmPlugin(Star):
     """对话认知中枢插件主体。"""
 
@@ -137,6 +148,7 @@ class CtmPlugin(Star):
         self._pending_sticky: dict[str, bool] = {}
         self._recent: dict[str, deque[str]] = {}
         self._last_assistant: dict[str, str] = {}
+        self._topic_disabled: set[str] = set()
         self.aggregation = Aggregator(
             enabled=self.cfg.topic.aggregation_enabled,
             debounce_seconds=self.cfg.topic.aggregation_debounce_seconds,
@@ -234,6 +246,9 @@ class CtmPlugin(Star):
         """处理一条消息：感知 → 召回 → 决策 → 挂到事件上。"""
         if not self.cfg.enabled:
             return
+        session_key = event.unified_msg_origin
+        if self.cfg.topic.mode == "off" or session_key in self._topic_disabled:
+            return
         signal = self.perception.extract(event)
         if signal.is_command:
             await self.aggregation.accept(
@@ -283,6 +298,8 @@ class CtmPlugin(Star):
                 )
             except Exception:  # noqa: BLE001
                 verdict = None
+        debug = self.cfg.topic.debug_mode
+        switched = False
         try:
             decision = self.cognition.decide(
                 signal, state, candidates, relationship, verdict=verdict
@@ -290,19 +307,40 @@ class CtmPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             log_event(LogCode.STORE_ERROR, session_id=session_id, error=str(exc))
             return
-        self._apply_topic_action(signal, state, decision, force_hard=False)
-        self._pending_old_topic[session_id] = (
-            old_topic.topic_id
-            if old_topic and decision.topic_action == TopicAction.SOFT_BOUNDARY
-            else None
-        )
+        if modes.should_auto_switch(
+            self.cfg.topic.mode,
+            verdict,
+            self.cfg.topic.auto_threshold,
+            debug,
+        ):
+            await self._auto_new_conversation(event, signal, state)
+            switched = True
+            state = self.topic_sm.load(session_id)
+            decision = self.cognition.decide(
+                signal,
+                state,
+                [],
+                relationship,
+                forced_action=TopicAction.CONTINUE,
+            )
+        if modes.should_persist_state(self.cfg.topic.mode, debug):
+            self._apply_topic_action(signal, state, decision, force_hard=False)
+            self._pending_old_topic[session_id] = (
+                old_topic.topic_id
+                if old_topic and decision.topic_action == TopicAction.SOFT_BOUNDARY
+                else None
+            )
+        else:
+            self._pending_old_topic[session_id] = None
         self._pending_emotion[session_id] = signal.emotion_score
         self._pending_sticky[session_id] = signal.sticky_hit
         event.set_extra(DECISION_EXTRA, decision)
         self.diag.turns += 1
         self.diag.decisions += 1
         self.diag.soft_switches += int(decision.topic_action == TopicAction.SOFT_BOUNDARY)
-        self.diag.hard_switches += int(decision.topic_action == TopicAction.HARD_SWITCH)
+        self.diag.hard_switches += int(
+            decision.topic_action == TopicAction.HARD_SWITCH or switched
+        )
         self.diag.recall_items += len(decision.recall_items)
         self.diag.dropped_items += len(decision.dropped_items)
         self.diag.injected_tokens += decision.estimated_tokens
@@ -323,6 +361,10 @@ class CtmPlugin(Star):
             return
         session_id = event.unified_msg_origin
         await self._inject_longterm(event, req)
+        if not modes.should_inject(
+            self.cfg.topic.mode, self.cfg.topic.debug_mode
+        ) or session_id in self._topic_disabled:
+            return
         decision = event.get_extra(DECISION_EXTRA)
         if not isinstance(decision, TurnDecision):
             decision = await self._fallback_decision(event)
@@ -338,6 +380,12 @@ class CtmPlugin(Star):
     ) -> TurnDecision | None:
         """消息入口被抢占时的兜底判定（只注入，不改话题状态）。"""
         if not self.cfg.topic.detect_in_hook_enabled or self.topic_judge is None:
+            return None
+        if not modes.should_inject(
+            self.cfg.topic.mode, self.cfg.topic.debug_mode
+        ):
+            return None
+        if event.unified_msg_origin in self._topic_disabled:
             return None
         signal = self.perception.extract(event)
         if not signal.text or signal.is_command:
@@ -408,6 +456,8 @@ class CtmPlugin(Star):
         if not self.cfg.enabled:
             return
         session_id = event.unified_msg_origin
+        if self.cfg.topic.debug_mode:
+            return
         response_text = getattr(response, "completion_text", "") or ""
         self._last_assistant[session_id] = response_text[:500]
         decision = event.get_extra(DECISION_EXTRA)
@@ -457,6 +507,70 @@ class CtmPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             log_event(LogCode.STORE_ERROR, session_id=state.session_id, error=str(exc))
         return state
+
+    async def _auto_new_conversation(
+        self,
+        event: AstrMessageEvent,
+        signal: Any,
+        state: Any,
+    ) -> None:
+        """mode=auto：新建对话（等价 /new），重置话题栈并建档。"""
+        try:
+            conv_mgr = getattr(self.context, "conversation_manager", None)
+            if conv_mgr is not None:
+                await conv_mgr.new_conversation(
+                    event.unified_msg_origin, event.get_platform_id()
+                )
+        except Exception as exc:  # noqa: BLE001
+            log_event(LogCode.STORE_ERROR, session_id=signal.session_id, error=str(exc))
+        try:
+            self.topic_sm.hard_switch(signal, state)
+            self._ensure_initial_topic(signal, state)
+        except Exception as exc:  # noqa: BLE001
+            log_event(LogCode.STORE_ERROR, session_id=signal.session_id, error=str(exc))
+        if self.cfg.topic.new_conversation_notice:
+            try:
+                from astrbot.api.event import MessageChain
+                from astrbot.api.message_components import Plain
+
+                await event.send(MessageChain([Plain("（已开启新话题）")]))
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def manual_new_topic(
+        self,
+        event: AstrMessageEvent,
+        title: str = "",
+    ) -> str:
+        """`/ctm topic new`：手动新建对话并重置话题。"""
+        signal = self.perception.extract(event)
+        try:
+            conv_mgr = getattr(self.context, "conversation_manager", None)
+            if conv_mgr is not None:
+                await conv_mgr.new_conversation(
+                    event.unified_msg_origin, event.get_platform_id()
+                )
+            state = self.topic_sm.load(signal.session_id)
+            self.topic_sm.hard_switch(signal, state)
+            new_title = (title or "").strip() or "新话题"
+            topic_id = self.store.create_topic(signal.session_id, new_title)
+            from .ctm.topic_state import TopicNode
+
+            now = time.time()
+            state.stack = [
+                TopicNode(
+                    topic_id=topic_id,
+                    title=new_title,
+                    created_at=now,
+                    last_active_at=now,
+                )
+            ]
+            state.current_topic = new_title
+            state.soft_boundary_pending = True
+            self.topic_sm.save(state)
+        except Exception as exc:  # noqa: BLE001
+            return f"新建话题失败：{exc}"
+        return f"已开启新对话，话题：{new_title}"
 
     def _apply_topic_action(
         self,

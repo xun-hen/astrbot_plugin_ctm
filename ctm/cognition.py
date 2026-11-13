@@ -83,9 +83,14 @@ class Cognition:
         *,
         force_hard: bool = False,
         verdict: Any | None = None,
+        forced_action: TopicAction | None = None,
     ) -> TurnDecision:
         """产出一轮决策。"""
-        action = self._topic_action(signal, state, force_hard, verdict)
+        action = (
+            forced_action
+            if forced_action is not None
+            else self._topic_action(signal, state, force_hard, verdict)
+        )
         persona = self._pick_persona(signal, state, relationship)
         ordered = sorted(candidates, key=lambda item: item.score, reverse=True)
         try:
