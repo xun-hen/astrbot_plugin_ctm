@@ -565,6 +565,49 @@ class Store:
             conn.commit()
             return int(cursor.rowcount or 0)
 
+    # ------------------------------------------------------------------ 页面统计
+    def recent_turn_logs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """全局最近的决策日志（页面用）。"""
+        with self._lock:
+            rows = self._require().execute(
+                """
+                SELECT id, turn_id, session_id, decision_json, injected_tokens,
+                       dropped_items, created_at
+                FROM turn_logs ORDER BY created_at DESC LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def recent_topics(self, limit: int = 50) -> list[dict[str, Any]]:
+        """全局最近活跃的话题（页面用）。"""
+        with self._lock:
+            rows = self._require().execute(
+                """
+                SELECT id, session_id, title, summary, status, created_at, last_active_at
+                FROM topics ORDER BY last_active_at DESC LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def stats(self) -> dict[str, int]:
+        """表计数（页面概览用）。"""
+        with self._lock:
+            conn = self._require()
+
+            def count(table: str) -> int:
+                row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                return int(row[0]) if row else 0
+
+            return {
+                "sessions": count("sessions"),
+                "topics": count("topics"),
+                "memories": count("memories"),
+                "turn_logs": count("turn_logs"),
+                "archive_failures": count("archive_failures"),
+            }
+
     # ------------------------------------------------------------------ export
     def export_session(self, session_id: str) -> dict[str, Any]:
         """导出单个会话的全部数据。"""

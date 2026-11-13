@@ -5,12 +5,12 @@
 | 项目 | 内容 |
 | --- | --- |
 | 插件 | `astrbot_plugin_ctm`（对话认知中枢 · 长期记忆） |
-| 版本 | `v0.3.0`（可运行；骨架期设计见 `docs/DESIGN.md`） |
+| 版本 | `v0.3.1`（可运行；骨架期设计见 `docs/DESIGN.md`） |
 | 仓库 | https://github.com/xun-hen/astrbot_plugin_ctm |
 | 分支 | `main`，交接基线 commit `beb87f2` |
 | 运行要求 | AstrBot `>= 4.26`，Python 3.10+，**核心零第三方依赖** |
 | 数据 | `data/plugin_data/astrbot_plugin_ctm/ctm.sqlite3`（WAL） |
-| 状态 | 消息聚合 / 双层话题判定 / 长期记忆 / 软边界 / 关系 / 归档均已实现并通过单测；未上架插件市场 |
+| 状态 | 消息聚合 / 双层话题判定 / 长期记忆 / 软边界 / 关系 / 归档 / 只读状态页均已实现并通过单测；未上架插件市场 |
 
 ---
 
@@ -70,6 +70,7 @@ astrbot_plugin_ctm/
 ├── config.py            强类型配置解析（含夹取/归一化），与 _conf_schema.json 双写
 ├── _conf_schema.json    WebUI 配置 schema（8 个分组）
 ├── metadata.yaml        插件市场元数据（name/version/repo/astrbot_version）
+├── pages/status/        插件详情页（只读运行状态：指标/配置/最近决策/记忆/健康）
 ├── README.md            用户向说明
 ├── CHANGELOG.md         版本记录
 ├── docs/
@@ -258,7 +259,8 @@ WebUI 分组（`_conf_schema.json`）：`basic` / `longterm` / `topic` / `memory
 ### P1：下一迭代建议
 
 4. **无 Embedding/rerank**：目前纯词法召回（`w_lexical/w_importance/w_recency`）。接口已留在 `textsim.SimilarityScorer`，接 Embedding 时只替换打分器，不改判定代码。
-5. **无 WebUI 管理页**：只有 `/ctm` 命令；可加 `register_web_api` + 页面（记忆列表/删除/导出/健康）。
+5. **页面只读**：`pages/status/` 只展示指标/配置/最近决策/话题/记忆/健康，没有编辑与删除；
+   写操作仍走 `/ctm` 命令与 LLM 工具。
 6. **`/ctm memory` 只覆盖短期记忆**：长期记忆走 `longterm list/delete`，命令层级可合并（`/ctm memory --longterm`）。
 7. **进程内字典无上限**：`main._pending_old_topic/_pending_emotion/_pending_sticky` 按会话累积，长期运行建议加清理（参考 `longterm` 的 5000 上限做法）。
 8. **集成测试缺失**：目前只有纯标准库单测 + 导入 smoke；建议补"真实事件替身 → 三个 hook → 落库"的端到端用例（fake provider）。

@@ -191,6 +191,12 @@ class CtmPlugin(Star):
                 logger.warning(f"[{PLUGIN_NAME}] 长期记忆初始化失败：{exc}")
                 self.lt = None
         self._started = True
+        try:
+            from .ctm.web_api import register_page_api
+
+            register_page_api(self.context, self)
+        except Exception as exc:  # noqa: BLE001 - 页面不可用不能拖垮插件
+            logger.warning(f"[{PLUGIN_NAME}] 页面后端注册失败：{exc}")
         logger.info(
             f"[{PLUGIN_NAME}] 已启动 | db={self._resolve_db_path()} | "
             f"longterm={'on' if self.lt else 'off'}"

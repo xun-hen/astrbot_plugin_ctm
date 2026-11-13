@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## v0.3.1
+
+### 新增
+
+- 插件可视化页面 `pages/status/`：只读运行状态面板（核心指标、生效配置、聚合进行中、
+  最近决策、最近话题、最近长期记忆、健康检查），每 5 秒自动刷新。
+- 页面后端 `ctm/web_api.py`：`/astrbot_plugin_ctm/overview|turns|topics|memories|health`
+  五个只读路由；老版本无 `astrbot.api.web` 时整体降级，不影响主流程。
+- `Store.recent_turn_logs/recent_topics/stats`、`LongTermStore.recent_items/count_total`、
+  `Aggregator.active_rounds` 等页面数据接口。
+
 ## v0.3.0
 
 ### 新增

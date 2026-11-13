@@ -128,6 +128,23 @@ class Aggregator:
         self._silence(event)
         return False
 
+    def active_rounds(self) -> list[dict[str, Any]]:
+        """返回当前进行中的聚合轮次（页面用）。"""
+        now = self._clock()
+        rows = []
+        for rnd in self._rounds.values():
+            if rnd.closed:
+                continue
+            rows.append(
+                {
+                    "session": rnd.key[0],
+                    "sender": rnd.key[1],
+                    "items": len(rnd.texts),
+                    "age_seconds": round(max(0.0, now - rnd.created_at), 1),
+                }
+            )
+        return rows
+
     def close(self) -> None:
         """插件卸载：结算所有进行中的轮次并停止计时器。"""
         self._closed = True

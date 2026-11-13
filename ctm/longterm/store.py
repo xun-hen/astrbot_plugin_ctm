@@ -292,6 +292,28 @@ class LongTermStore:
             for row in rows
         ]
 
+    def recent_items(self, limit: int = 50) -> list[dict[str, Any]]:
+        """全局最近更新的长期记忆（页面用）。"""
+        with self._lock:
+            rows = self._require().execute(
+                """
+                SELECT id, scope_type, scope_id, kind, slot_key, content,
+                       importance, confidence, status, updated_at
+                FROM lt_memories WHERE status != 'archived'
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_total(self) -> int:
+        """长期记忆总条数。"""
+        with self._lock:
+            row = self._require().execute(
+                "SELECT COUNT(*) FROM lt_memories WHERE status != 'archived'"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
     # ------------------------------------------------------------------ audit
     def audit(
         self,

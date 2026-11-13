@@ -22,6 +22,7 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 | 人格模式 | daily / comfort / playful / serious，由情绪、张力与粘性命中决定 |
 | 单点注入 | 全插件只在 `on_llm_request` 追加一次，注入量有上限、有日志 |
 | 异步归档 | 单 worker 串行写 SQLite，失败重试并落 `archive_failures` |
+| 可视化页面 | 插件详情页「运行状态」：核心指标、生效配置、聚合进行中、最近决策/话题/记忆、健康检查（只读） |
 | 可管理 | `/ctm` 命令 + `memory_search / memory_save / memory_forget` 工具 |
 | 可回退 | `basic.enabled=false` 完全停用；长期记忆可单独关闭 |
 
@@ -84,7 +85,10 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 ```
 main.py                 AstrBot 接线（hook / 生命周期 / 工具）
 config.py               强类型配置（与 _conf_schema.json 对齐）
+pages/status/           插件详情页（只读运行状态，bridge + 5 个页面 API）
 ctm/
+├── aggregation.py      连发消息防抖聚合（合并成一轮）
+├── topic_judge.py      话题判定：启发式 + 可选 LLM 兜底
 ├── perception.py       规则感知（无 IO，P99 < 5ms）
 ├── textsim.py          词法相似度（Jaccard + 字符 2-gram）
 ├── topic_state.py      话题栈 / 软边界 / 弹栈 / 硬切
@@ -96,6 +100,7 @@ ctm/
 ├── store.py            唯一 SQLite 入口
 ├── commands.py         /ctm 子命令
 ├── observability.py    日志码与诊断计数
+├── web_api.py          页面只读 API
 └── longterm/           长期记忆（config/store/retriever/extractor/manager）
 ```
 
