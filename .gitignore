@@ -6,3 +6,15 @@ __pycache__/
 data/
 exports/
 .venv/
+
+# 交接文档仅本地保留，不随仓库分发
+docs/HANDOVER.md
+
+# 本地私密配置 / 凭据（不推送）
+.env
+.env.*
+*.pem
+*.key
+secrets*.json
+credentials*.json
+api_key*.txt

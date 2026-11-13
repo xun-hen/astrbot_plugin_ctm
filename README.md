@@ -116,7 +116,7 @@ ctm/
 
 ## 开发与测试
 
-交接与维护说明见 [docs/HANDOVER.md](docs/HANDOVER.md)；架构设计见 [docs/DESIGN.md](docs/DESIGN.md)。
+交接与维护说明仅本地保留、不随仓库分发；架构设计见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ```bash
 python -m compileall .
