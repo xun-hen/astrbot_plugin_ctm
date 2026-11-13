@@ -82,9 +82,10 @@ class Cognition:
         relationship: RelationshipState,
         *,
         force_hard: bool = False,
+        verdict: Any | None = None,
     ) -> TurnDecision:
         """产出一轮决策。"""
-        action = self._topic_action(signal, state, force_hard)
+        action = self._topic_action(signal, state, force_hard, verdict)
         persona = self._pick_persona(signal, state, relationship)
         ordered = sorted(candidates, key=lambda item: item.score, reverse=True)
         try:
@@ -128,13 +129,17 @@ class Cognition:
         )
 
     def _topic_action(
-        self, signal: Any, state: Any, force_hard: bool
+        self,
+        signal: Any,
+        state: Any,
+        force_hard: bool,
+        verdict: Any | None = None,
     ) -> TopicAction:
         """决定本轮话题动作（只决定，不修改状态）。"""
         if force_hard:
             return TopicAction.HARD_SWITCH
         try:
-            if self._topic_sm.should_soft_boundary(signal, state):
+            if self._topic_sm.should_soft_boundary(signal, state, verdict):
                 if self._cfg.topic.auto_switch_strategy == "hard":
                     return TopicAction.HARD_SWITCH
                 return TopicAction.SOFT_BOUNDARY

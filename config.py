@@ -67,6 +67,26 @@ class TopicConfig:
     )
     sticky_regex: tuple[str, ...] = ()
     new_intent_markers: tuple[str, ...] = ("另外", "话说", "换个话题", "对了", "突然想到")
+    # 消息聚合（连发合并成一轮）
+    aggregation_enabled: bool = True
+    aggregation_debounce_seconds: float = 2.0
+    aggregation_max_wait_seconds: float = 12.0
+    # 话题判定（启发式 + 可选 LLM 兜底）
+    judge_enabled: bool = True
+    judge_provider_id: str = ""
+    judge_always_llm: bool = False
+    judge_sim_continue: float = 0.5
+    judge_sim_new_topic: float = 0.12
+    judge_time_gap_minutes: int = 45
+    judge_min_message_length: int = 6
+    judge_short_message_length: int = 25
+    judge_history_turns: int = 3
+    judge_include_assistant_reply: bool = True
+    judge_max_checks_per_hour: int = 30
+    judge_timeout_seconds: float = 8.0
+    judge_min_confidence: float = 0.6
+    # 消息入口被抢占时，是否在请求钩子里兜底判定并注入提示
+    detect_in_hook_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -360,6 +380,107 @@ def load_config(raw: dict[str, Any] | None) -> Config:
             ),
             new_intent_markers=_str_list(
                 topic_raw, "new_intent_markers", defaults.topic.new_intent_markers
+            ),
+            aggregation_enabled=_bool(
+                topic_raw,
+                "aggregation_enabled",
+                defaults.topic.aggregation_enabled,
+            ),
+            aggregation_debounce_seconds=_float(
+                topic_raw,
+                "aggregation_debounce_seconds",
+                defaults.topic.aggregation_debounce_seconds,
+                0.0,
+                30.0,
+            ),
+            aggregation_max_wait_seconds=_float(
+                topic_raw,
+                "aggregation_max_wait_seconds",
+                defaults.topic.aggregation_max_wait_seconds,
+                0.0,
+                120.0,
+            ),
+            judge_enabled=_bool(
+                topic_raw, "judge_enabled", defaults.topic.judge_enabled
+            ),
+            judge_provider_id=_str(
+                topic_raw, "judge_provider_id", defaults.topic.judge_provider_id
+            ),
+            judge_always_llm=_bool(
+                topic_raw, "judge_always_llm", defaults.topic.judge_always_llm
+            ),
+            judge_sim_continue=_float(
+                topic_raw,
+                "judge_sim_continue",
+                defaults.topic.judge_sim_continue,
+                0.0,
+                1.0,
+            ),
+            judge_sim_new_topic=_float(
+                topic_raw,
+                "judge_sim_new_topic",
+                defaults.topic.judge_sim_new_topic,
+                0.0,
+                1.0,
+            ),
+            judge_time_gap_minutes=_int(
+                topic_raw,
+                "judge_time_gap_minutes",
+                defaults.topic.judge_time_gap_minutes,
+                1,
+                10080,
+            ),
+            judge_min_message_length=_int(
+                topic_raw,
+                "judge_min_message_length",
+                defaults.topic.judge_min_message_length,
+                1,
+                100,
+            ),
+            judge_short_message_length=_int(
+                topic_raw,
+                "judge_short_message_length",
+                defaults.topic.judge_short_message_length,
+                1,
+                200,
+            ),
+            judge_history_turns=_int(
+                topic_raw,
+                "judge_history_turns",
+                defaults.topic.judge_history_turns,
+                0,
+                20,
+            ),
+            judge_include_assistant_reply=_bool(
+                topic_raw,
+                "judge_include_assistant_reply",
+                defaults.topic.judge_include_assistant_reply,
+            ),
+            judge_max_checks_per_hour=_int(
+                topic_raw,
+                "judge_max_checks_per_hour",
+                defaults.topic.judge_max_checks_per_hour,
+                0,
+                1000,
+            ),
+            judge_timeout_seconds=_float(
+                topic_raw,
+                "judge_timeout_seconds",
+                defaults.topic.judge_timeout_seconds,
+                1.0,
+                120.0,
+            ),
+            judge_min_confidence=_float(
+                topic_raw,
+                "judge_min_confidence",
+                defaults.topic.judge_min_confidence,
+                0.0,
+                1.0,
+            ),
+            detect_in_hook_enabled=_bool(
+                topic_raw,
+                "detect_in_hook_enabled",
+                defaults.topic.detect_in_hook_enabled,
             ),
         ),
         memory=MemoryConfig(

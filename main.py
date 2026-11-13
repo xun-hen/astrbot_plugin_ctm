@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
 
 from .config import PLUGIN_NAME, Config, load_config
+from .ctm.aggregation import Aggregator
 from .ctm.archiver import ArchiveJob, Archiver
 from .ctm.cognition import Cognition, TurnDecision
 from .ctm.commands import CtmCommands
@@ -31,6 +33,7 @@ from .ctm.observability import Diag, LogCode, configure, log_event
 from .ctm.perception import Perception
 from .ctm.relationship import RelationshipManager
 from .ctm.store import Store
+from .ctm.topic_judge import TopicJudge
 from .ctm.topic_state import TopicStateMachine
 
 MESSAGE_PRIORITY = 1000
@@ -132,6 +135,30 @@ class CtmPlugin(Star):
         self._pending_old_topic: dict[str, int | None] = {}
         self._pending_emotion: dict[str, float] = {}
         self._pending_sticky: dict[str, bool] = {}
+        self._recent: dict[str, deque[str]] = {}
+        self._last_assistant: dict[str, str] = {}
+        self.aggregation = Aggregator(
+            enabled=self.cfg.topic.aggregation_enabled,
+            debounce_seconds=self.cfg.topic.aggregation_debounce_seconds,
+            max_wait_seconds=self.cfg.topic.aggregation_max_wait_seconds,
+        )
+        self.topic_judge: TopicJudge | None = None
+        if self.cfg.topic.judge_enabled:
+            self.topic_judge = TopicJudge(
+                provider_getter=self._get_judge_provider,
+                provider_id=self.cfg.topic.judge_provider_id,
+                timeout_seconds=self.cfg.topic.judge_timeout_seconds,
+                max_checks_per_hour=self.cfg.topic.judge_max_checks_per_hour,
+                history_turns=self.cfg.topic.judge_history_turns,
+                include_assistant_reply=self.cfg.topic.judge_include_assistant_reply,
+                always_llm=self.cfg.topic.judge_always_llm,
+                sim_continue=self.cfg.topic.judge_sim_continue,
+                sim_new_topic=self.cfg.topic.judge_sim_new_topic,
+                time_gap_minutes=self.cfg.topic.judge_time_gap_minutes,
+                min_message_length=self.cfg.topic.judge_min_message_length,
+                short_message_length=self.cfg.topic.judge_short_message_length,
+                min_new_confidence=self.cfg.topic.judge_min_confidence,
+            )
         logger.info(f"[{PLUGIN_NAME}] 实例已构造 | 数据目录={self.data_dir}")
 
     # ------------------------------------------------------------------ 生命周期
@@ -174,6 +201,10 @@ class CtmPlugin(Star):
         global _INSTANCE
         self._started = False
         try:
+            self.aggregation.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             await self.archiver.stop(5.0)
         except Exception:  # noqa: BLE001
             pass
@@ -198,9 +229,35 @@ class CtmPlugin(Star):
         if not self.cfg.enabled:
             return
         signal = self.perception.extract(event)
-        if signal.is_command or not signal.text:
+        if signal.is_command:
+            await self.aggregation.accept(
+                event,
+                key=(signal.session_id, signal.user_id),
+                text=signal.text,
+                is_command=True,
+            )
             return
+        if not signal.text:
+            return
+        if self.cfg.topic.aggregation_enabled:
+            proceed = await self.aggregation.accept(
+                event,
+                key=(signal.session_id, signal.user_id),
+                text=signal.text,
+            )
+            if not proceed:
+                return
+            # owner 恢复后事件正文已合并，重新感知一次。
+            signal = self.perception.extract(event)
+            if not signal.text:
+                return
         session_id = signal.session_id
+        recent = self._recent.setdefault(
+            session_id,
+            deque(maxlen=max(1, self.cfg.topic.judge_history_turns) + 1),
+        )
+        recent_list = list(recent)
+        recent.append(signal.text)
         state = self.topic_sm.load(session_id)
         self.store.ensure_session(session_id, signal.user_id)
         if not state.stack:
@@ -208,8 +265,22 @@ class CtmPlugin(Star):
         relationship = self.relationship.load(session_id)
         candidates = self.memory.recall_candidates(signal, state)
         old_topic = state.focus()
+        verdict = None
+        if self.topic_judge is not None:
+            try:
+                verdict = await self.topic_judge.judge(
+                    session_id=session_id,
+                    message=signal.text,
+                    state=state,
+                    recent=recent_list,
+                    last_assistant=self._last_assistant.get(session_id, ""),
+                )
+            except Exception:  # noqa: BLE001
+                verdict = None
         try:
-            decision = self.cognition.decide(signal, state, candidates, relationship)
+            decision = self.cognition.decide(
+                signal, state, candidates, relationship, verdict=verdict
+            )
         except Exception as exc:  # noqa: BLE001
             log_event(LogCode.STORE_ERROR, session_id=session_id, error=str(exc))
             return
@@ -247,13 +318,59 @@ class CtmPlugin(Star):
         session_id = event.unified_msg_origin
         await self._inject_longterm(event, req)
         decision = event.get_extra(DECISION_EXTRA)
+        if not isinstance(decision, TurnDecision):
+            decision = await self._fallback_decision(event)
         if decision is None:
             if self.diag.decisions:
                 self.diag.no_decision += 1
                 log_event(LogCode.NO_DECISION, session_id=session_id)
             return
-        if not isinstance(decision, TurnDecision):
-            return
+        self._inject_decision(req, decision, session_id)
+
+    async def _fallback_decision(
+        self, event: AstrMessageEvent
+    ) -> TurnDecision | None:
+        """消息入口被抢占时的兜底判定（只注入，不改话题状态）。"""
+        if not self.cfg.topic.detect_in_hook_enabled or self.topic_judge is None:
+            return None
+        signal = self.perception.extract(event)
+        if not signal.text or signal.is_command:
+            return None
+        session_id = signal.session_id
+        state = self.topic_sm.load(session_id)
+        if not state.stack:
+            return None
+        relationship = self.relationship.load(session_id)
+        recent_items = list(self._recent.get(session_id, ()))
+        recent = recent_items[-max(1, self.cfg.topic.judge_history_turns) :]
+        try:
+            verdict = await self.topic_judge.judge(
+                session_id=session_id,
+                message=signal.text,
+                state=state,
+                recent=recent,
+                last_assistant=self._last_assistant.get(session_id, ""),
+            )
+            decision = self.cognition.decide(
+                signal, state, [], relationship, verdict=verdict
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        self.diag.no_decision += 1
+        log_event(
+            LogCode.PREEMPTED,
+            session_id=session_id,
+            action=decision.topic_action.value,
+        )
+        return decision
+
+    def _inject_decision(
+        self,
+        req: ProviderRequest,
+        decision: TurnDecision,
+        session_id: str,
+    ) -> None:
+        """把决策渲染成 Prompt 块并追加（唯一渲染点）。"""
         try:
             payload = self.builder.build(decision)
             payload = self.builder.cap_by_ratio(
@@ -286,6 +403,7 @@ class CtmPlugin(Star):
             return
         session_id = event.unified_msg_origin
         response_text = getattr(response, "completion_text", "") or ""
+        self._last_assistant[session_id] = response_text[:500]
         decision = event.get_extra(DECISION_EXTRA)
         if isinstance(decision, TurnDecision):
             job = ArchiveJob(
@@ -408,8 +526,20 @@ class CtmPlugin(Star):
             pass
 
     async def _get_provider(self, session_id: str) -> Any:
-        """解析 chat provider（兼容 4.26 的同步接口与 4.29 的异步接口）。"""
-        provider_id = self.cfg.longterm.extract_provider_id
+        """解析长期记忆抽取用的 chat provider。"""
+        return await self._resolve_provider(
+            session_id, self.cfg.longterm.extract_provider_id
+        )
+
+    async def _get_judge_provider(self, session_id: str) -> Any:
+        """解析话题判定用的 chat provider。"""
+        return await self._resolve_provider(
+            session_id, self.cfg.topic.judge_provider_id
+        )
+
+    async def _resolve_provider(self, session_id: str, provider_id: str = "") -> Any:
+        """解析 chat provider（兼容 4.26 同步接口与 4.29 异步接口）。"""
+
         try:
             if provider_id:
                 manager = getattr(self.context, "provider_manager", None)

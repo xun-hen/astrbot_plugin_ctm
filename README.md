@@ -12,6 +12,8 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 
 | 能力 | 说明 |
 | --- | --- |
+| 消息聚合 | 同一会话/同一发送者的连发消息先合并成一轮，再判定、只回一次 |
+| 话题判定 | 启发式（相似度/承接词/换话题词/时间间隔）优先，拿不准时问一次便宜模型；失败一律按延续 |
 | 长期记忆 | 跨会话记住用户/群聊的稳定事实；回复后异步抽取，请求前按预算召回 |
 | 作用域隔离 | `user = platform:sender`、`group = platform:group`，群聊可同时读两者，成员之间互不串号 |
 | 软话题边界 | 换话题只压栈、不清空上下文；回溯旧话题时弹栈自然衔接 |
@@ -37,6 +39,9 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
+| `topic.aggregation_enabled` | `true` | 连发消息合并（默认 2s 防抖，总等待上限 12s） |
+| `topic.judge_enabled` | `true` | 话题判定；`judge_provider_id` 留空沿用当前模型 |
+| `topic.judge_max_checks_per_hour` | `30` | 每会话每小时模型判定上限 |
 | `longterm.enabled` | `true` | 长期记忆总开关 |
 | `longterm.extract.every_n_turns` | `2` | 每多少轮抽取一次；成本主要旋钮 |
 | `longterm.extract.max_calls_per_hour` | `30` | 每会话每小时抽取上限 |
@@ -45,6 +50,7 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 | `memory.injection_budget_tokens` | `1000` | CTM 短期记忆包注入预算 |
 | `injection.max_prompt_growth_ratio` | `0.25` | 注入不超过原 system_prompt 的 25% |
 | `topic.auto_switch_strategy` | `soft` | `off` 只判定不动作；`soft` 压栈（推荐） |
+| `topic.detect_in_hook_enabled` | `true` | 消息入口被抢占时，在请求钩子兜底判定并注入 |
 | `basic.enabled` | `true` | 插件总开关 |
 
 敏感内容（密码、密钥、证件号、银行卡号）默认拒绝写入长期记忆。

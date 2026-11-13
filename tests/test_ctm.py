@@ -105,6 +105,19 @@ class ConfigTest(unittest.TestCase):
             default_of("memory", "injection_budget_tokens"),
         )
         self.assertAlmostEqual(cfg.memory.weights.total(), 1.0, places=6)
+        for key in (
+            "aggregation_enabled",
+            "aggregation_debounce_seconds",
+            "judge_enabled",
+            "judge_min_confidence",
+            "judge_time_gap_minutes",
+            "detect_in_hook_enabled",
+        ):
+            self.assertEqual(
+                getattr(cfg.topic, key),
+                schema["topic"]["items"][key]["default"],
+                f"topic.{key} 与 schema 默认值不一致",
+            )
 
     def test_invalid_values_fall_back(self) -> None:
         cfg = load_config(

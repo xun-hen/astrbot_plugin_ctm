@@ -111,14 +111,30 @@ class TopicStateMachine:
             soft_boundary_pending=state.soft_boundary_pending,
         )
 
-    def should_soft_boundary(self, signal: Any, state: TopicState) -> bool:
-        """判定本轮是否触发软边界。"""
+    def should_soft_boundary(
+        self,
+        signal: Any,
+        state: TopicState,
+        verdict: Any | None = None,
+    ) -> bool:
+        """判定本轮是否触发软边界。
+
+        Args:
+            signal: PerceptionSignal。
+            state: 当前话题状态。
+            verdict: 话题判定结果（`topic_judge.Verdict`）；None 时退回纯启发式。
+
+        Returns:
+            是否软切。
+        """
         cfg = self._cfg
         if not cfg.auto_switch_enabled:
             return False
         if getattr(signal, "is_command", False):
             return False
         if self.is_sticky(signal):
+            return False
+        if int(getattr(signal, "length", 0) or 0) < cfg.judge_min_message_length:
             return False
         if state.turns_since_switch < cfg.min_turns_before_switch:
             return False
@@ -127,6 +143,8 @@ class TopicStateMachine:
             return False
         if not state.stack:
             return False
+        if verdict is not None:
+            return bool(getattr(verdict, "is_new_topic", False))
         current = state.focus()
         focus_text = f"{current.title} {current.summary}".strip() if current else ""
         similarity = topic_similarity(focus_text, signal.text, self._scorer)

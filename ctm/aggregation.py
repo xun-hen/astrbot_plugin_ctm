@@ -1,0 +1,215 @@
+"""消息聚合：把同一会话里连发的几条消息缓冲成一轮。
+
+机制与 `astrbot_plugin_msg_aggregator` / 话题路由器 PRO 的 `aggregation/` 相同：
+
+1. 第一条消息成为 **owner**，`on_message` 里 `await flush.wait()` 挂起，先不放行下游；
+2. 后续消息（同会话、同发送者）把正文追加到本轮，然后 `stop_event()` 静默；
+3. 防抖计时器到期（或达到总等待上限）→ `flush.set()`，owner 恢复；
+4. owner 把合并文本写回 `event.message_str`，管线继续，于是 LLM 只被调用一次。
+
+与完整版相比，这里刻意裁掉了：输入状态感知、撤回过滤、附件转存、统计页面、
+跨进程锁。图片等非文本组件直接追加到 owner 的消息链上，不复制文件。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+DEFAULT_SEPARATOR = "\n"
+MAX_ROUNDS = 256
+
+
+@dataclass
+class Round:
+    """一轮聚合。"""
+
+    key: tuple[str, str]
+    owner_event: Any
+    texts: list[str] = field(default_factory=list)
+    extra_components: list[Any] = field(default_factory=list)
+    created_at: float = 0.0
+    last_at: float = 0.0
+    flush: asyncio.Event = field(default_factory=asyncio.Event)
+    timer: asyncio.Task[None] | None = None
+    closed: bool = False
+
+
+class Aggregator:
+    """按 `(umo, sender)` 分桶的防抖聚合器。"""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        debounce_seconds: float = 2.0,
+        max_wait_seconds: float = 12.0,
+        separator: str = DEFAULT_SEPARATOR,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """初始化。
+
+        Args:
+            enabled: 是否启用聚合；关闭时 `accept()` 立即放行。
+            debounce_seconds: 最后一条消息之后的等待秒数。
+            max_wait_seconds: 从第一条消息算起的总等待上限。
+            separator: 合并文本的分隔符。
+            clock: 单调时钟，测试可注入。
+        """
+        self.enabled = enabled
+        self.debounce_seconds = max(0.0, float(debounce_seconds))
+        self.max_wait_seconds = max(self.debounce_seconds, float(max_wait_seconds))
+        self.separator = separator
+        self._clock = clock
+        self._rounds: dict[tuple[str, str], Round] = {}
+        self._closed = False
+
+    async def accept(
+        self,
+        event: Any,
+        *,
+        key: tuple[str, str],
+        text: str,
+        is_command: bool = False,
+    ) -> bool:
+        """接收一条消息。
+
+        Args:
+            event: 消息事件。
+            key: `(unified_msg_origin, sender_id)`。
+            text: 本条消息的纯文本。
+            is_command: 指令消息；指令不参与聚合，并会立即结算当前轮。
+
+        Returns:
+            True 表示调用方应继续处理该事件（owner 已恢复）；
+            False 表示该事件已被消费（正在缓冲的后续消息），调用方应直接返回。
+        """
+        if self._closed or not self.enabled:
+            return True
+        if is_command:
+            self._flush_key(key)
+            return True
+
+        clean = (text or "").strip()
+        now = self._clock()
+        rnd = self._rounds.get(key)
+        if rnd is None or rnd.closed:
+            if len(self._rounds) >= MAX_ROUNDS:
+                # 极端情况下不让字典无限增长：结算最老的一轮。
+                self._flush_oldest()
+            rnd = Round(
+                key=key,
+                owner_event=event,
+                texts=[clean] if clean else [],
+                created_at=now,
+                last_at=now,
+            )
+            self._rounds[key] = rnd
+            self._arm(rnd)
+        else:
+            if clean:
+                rnd.texts.append(clean)
+            self._append_extra_components(rnd, event)
+            rnd.last_at = now
+            self._arm(rnd)
+
+        if rnd.owner_event is event:
+            try:
+                await rnd.flush.wait()
+            except asyncio.CancelledError:
+                self._abort(key, rnd)
+                raise
+            self._reconstruct(rnd)
+            self._finish(key, rnd)
+            return True
+
+        self._silence(event)
+        return False
+
+    def close(self) -> None:
+        """插件卸载：结算所有进行中的轮次并停止计时器。"""
+        self._closed = True
+        for key in list(self._rounds):
+            self._flush_key(key)
+        for rnd in list(self._rounds.values()):
+            if rnd.timer is not None:
+                rnd.timer.cancel()
+
+    # ------------------------------------------------------------------ internal
+    def _append_extra_components(self, rnd: Round, event: Any) -> None:
+        message_obj = getattr(event, "message_obj", None)
+        components = getattr(message_obj, "message", None)
+        if not isinstance(components, list):
+            return
+        for component in components:
+            if getattr(component, "type", "") != "plain":
+                rnd.extra_components.append(component)
+
+    def _arm(self, rnd: Round) -> None:
+        if rnd.timer is not None:
+            rnd.timer.cancel()
+        now = self._clock()
+        remaining = self.max_wait_seconds - (now - rnd.created_at)
+        wait = max(0.0, min(self.debounce_seconds, remaining))
+        rnd.timer = asyncio.create_task(self._wait(rnd, wait))
+
+    async def _wait(self, rnd: Round, seconds: float) -> None:
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        if not rnd.closed:
+            rnd.flush.set()
+
+    def _reconstruct(self, rnd: Round) -> None:
+        """把合并文本写回 owner 事件；图片等组件追加到消息链。"""
+        merged = self.separator.join(rnd.texts).strip()
+        event = rnd.owner_event
+        try:
+            event.message_str = merged
+        except Exception:  # noqa: BLE001
+            pass
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj is None:
+            return
+        try:
+            message_obj.message_str = merged
+        except Exception:  # noqa: BLE001
+            pass
+        components = getattr(message_obj, "message", None)
+        if isinstance(components, list) and rnd.extra_components:
+            message_obj.message = [*components, *rnd.extra_components]
+
+    def _finish(self, key: tuple[str, str], rnd: Round) -> None:
+        rnd.closed = True
+        if rnd.timer is not None:
+            rnd.timer.cancel()
+        self._rounds.pop(key, None)
+
+    def _abort(self, key: tuple[str, str], rnd: Round) -> None:
+        rnd.closed = True
+        if rnd.timer is not None:
+            rnd.timer.cancel()
+        self._rounds.pop(key, None)
+
+    def _flush_key(self, key: tuple[str, str]) -> None:
+        rnd = self._rounds.get(key)
+        if rnd is not None and not rnd.closed:
+            rnd.flush.set()
+
+    def _flush_oldest(self) -> None:
+        if not self._rounds:
+            return
+        oldest_key = min(self._rounds, key=lambda item: self._rounds[item].created_at)
+        self._flush_key(oldest_key)
+
+    @staticmethod
+    def _silence(event: Any) -> None:
+        stopper = getattr(event, "stop_event", None)
+        if callable(stopper):
+            try:
+                stopper()
+            except Exception:  # noqa: BLE001
+                pass

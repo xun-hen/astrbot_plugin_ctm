@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## v0.3.0
+
+### 新增
+
+- 内建消息聚合（`ctm/aggregation.py`）：按 `(会话, 发送者)` 分桶、防抖 2s、
+  总等待上限 12s；连发消息合并成一轮，只触发一次判定与一次 LLM 调用。
+- 双层话题判定（`ctm/topic_judge.py`）：启发式（相似度/承接词/换话题词/时间间隔/
+  短消息保护）+ 可选 LLM 兜底（超时/报错/JSON 非法一律按延续）。
+- 请求钩子兜底判定：消息入口被更高优先级者拦截时，仍在 `on_llm_request` 判定
+  并注入提示，落 `WARN_PREEMPTED`。
+- 配置：`topic.aggregation_*`、`topic.judge_*`、`topic.detect_in_hook_enabled`。
+
+### 修复
+
+- 软边界增加短消息保护，避免"嗯/继续"在低相似度时误切话题。
+
 ## v0.2.0
 
 ### 新增

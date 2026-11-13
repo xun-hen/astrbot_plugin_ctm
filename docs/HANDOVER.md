@@ -5,12 +5,12 @@
 | 项目 | 内容 |
 | --- | --- |
 | 插件 | `astrbot_plugin_ctm`（对话认知中枢 · 长期记忆） |
-| 版本 | `v0.2.0`（可运行；骨架期设计见 `docs/DESIGN.md`） |
+| 版本 | `v0.3.0`（可运行；骨架期设计见 `docs/DESIGN.md`） |
 | 仓库 | https://github.com/xun-hen/astrbot_plugin_ctm |
 | 分支 | `main`，交接基线 commit `beb87f2` |
 | 运行要求 | AstrBot `>= 4.26`，Python 3.10+，**核心零第三方依赖** |
 | 数据 | `data/plugin_data/astrbot_plugin_ctm/ctm.sqlite3`（WAL） |
-| 状态 | 长期记忆 / 话题软边界 / 关系状态 / 异步归档均已实现并通过单测；未上架插件市场 |
+| 状态 | 消息聚合 / 双层话题判定 / 长期记忆 / 软边界 / 关系 / 归档均已实现并通过单测；未上架插件市场 |
 
 ---
 
@@ -108,8 +108,10 @@ astrbot_plugin_ctm/
 ```
 平台消息
   └─ on_message
-       ├─ Perception.extract           → PerceptionSignal
+       ├─ Aggregator.accept            → 连发合并；后续消息 stop_event
+       ├─ Perception.extract           → PerceptionSignal（合并后的文本）
        ├─ TopicStateMachine.load       → TopicState（空栈时建初始话题）
+       ├─ TopicJudge.judge             → 启发式/LLM 话题判定
        ├─ MemoryStore.recall_candidates→ RecallItem[]
        ├─ Cognition.decide             → TurnDecision
        ├─ 落地话题动作（soft/hard/continue）、保存状态
@@ -117,6 +119,7 @@ astrbot_plugin_ctm/
 
 LLM 请求前
   └─ on_llm_request
+       ├─ 无决策时 TopicJudge 兜底判定  → WARN_PREEMPTED（不改话题状态）
        ├─ LongTermMemory.recall        → 临时 TextPart（mark_as_temp）
        ├─ InjectionBuilder.build       → CTM Prompt 块
        ├─ InjectionBuilder.cap_by_ratio→ 按比例截断
@@ -265,7 +268,10 @@ WebUI 分组（`_conf_schema.json`）：`basic` / `longterm` / `topic` / `memory
 9. 话题标题目前是"截断 16 字"规则，可换轻量模型；
 10. `archive_failures` 无自动重放工具，可加 `/ctm replay-failures`；
 11. `turn_logs` 无自动清理（`purge_turn_logs` 已实现但未调度）；
-12. 插件市场尚未提交（见 §12）。
+12. 插件市场尚未提交（见 §12）；
+13. 聚合是精简版：未实现输入状态感知、撤回过滤、图片转存、聚合统计页（完整版可参考
+    `astrbot_plugin_msg_aggregator` / 话题路由器 PRO 的 `aggregation/`）；
+14. 判定模型未配置时只用启发式；`judge_always_llm` 成本较高，默认关闭。
 
 ---
 
@@ -284,6 +290,7 @@ WebUI 分组（`_conf_schema.json`）：`basic` / `longterm` / `topic` / `memory
 
 - [ ] 按 §2 装插件，发一条消息，确认日志出现 `INFO_DECISION`；
 - [ ] `/ctm status` 有话题/关系/预算输出；
+- [ ] 连发两条消息（2 秒内），确认只回一次且日志只有一条 `INFO_DECISION`；
 - [ ] 发一条"我叫 X / 我住在 Y"，等 2~4 轮后 `/ctm longterm list` 能看到；
 - [ ] 新开会话问"我叫什么"，确认长期记忆被注入（回复里能体现）；
 - [ ] `/ctm memory edit <id> 新内容` 后 `corrected_count` 增加、重要度下降；

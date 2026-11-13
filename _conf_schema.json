@@ -255,6 +255,106 @@
         "type": "list",
         "default": ["另外", "话说", "换个话题", "对了", "突然想到"],
         "hint": "出现这些词时，即使相似度没低到阈值也可能判为新话题（双信号中的第二个信号）。"
+      },
+      "aggregation_enabled": {
+        "description": "消息聚合",
+        "type": "bool",
+        "default": true,
+        "hint": "把同一会话、同一发送者的连发消息合并成一轮，只触发一次判定和一次 LLM 调用。"
+      },
+      "aggregation_debounce_seconds": {
+        "description": "聚合防抖（秒）",
+        "type": "float",
+        "default": 2.0,
+        "hint": "最后一条消息之后等多久结算。"
+      },
+      "aggregation_max_wait_seconds": {
+        "description": "聚合总等待上限（秒）",
+        "type": "float",
+        "default": 12.0,
+        "hint": "从第一条消息算起，防止用户一直发导致永不结算。"
+      },
+      "judge_enabled": {
+        "description": "启用话题判定",
+        "type": "bool",
+        "default": true,
+        "hint": "启发式判定总是先跑；勾选后允许在拿不准时问一次模型。"
+      },
+      "judge_provider_id": {
+        "description": "判定模型",
+        "type": "string",
+        "default": "",
+        "hint": "留空沿用当前会话模型；建议填便宜的快模型，格式以 provider 列表为准。"
+      },
+      "judge_always_llm": {
+        "description": "每轮都问模型",
+        "type": "bool",
+        "default": false,
+        "hint": "成本高，一般不用；开启后启发式只用于兜底。"
+      },
+      "judge_sim_continue": {
+        "description": "判延续的相似度阈值",
+        "type": "float",
+        "default": 0.5,
+        "hint": "高于它直接判延续，不问模型。"
+      },
+      "judge_sim_new_topic": {
+        "description": "判新话题的相似度阈值",
+        "type": "float",
+        "default": 0.12,
+        "hint": "低于它且无承接词才可能判新话题。"
+      },
+      "judge_time_gap_minutes": {
+        "description": "长间隔阈值（分钟）",
+        "type": "int",
+        "default": 45,
+        "hint": "隔得久不凭时间硬切，而是请模型判断下一句是否延续。"
+      },
+      "judge_min_message_length": {
+        "description": "最短判定长度",
+        "type": "int",
+        "default": 6,
+        "hint": "短于此的消息（如“嗯”“继续”）按延续处理。"
+      },
+      "judge_short_message_length": {
+        "description": "短句长度上限",
+        "type": "int",
+        "default": 25,
+        "hint": "不超过该长度且字面不重叠的消息，交给模型判语义。"
+      },
+      "judge_history_turns": {
+        "description": "判定参考历史条数",
+        "type": "int",
+        "default": 3
+      },
+      "judge_include_assistant_reply": {
+        "description": "让判定模型看上一句回复",
+        "type": "bool",
+        "default": true
+      },
+      "judge_max_checks_per_hour": {
+        "description": "每小时模型判定上限",
+        "type": "int",
+        "default": 30,
+        "hint": "按会话计；0 表示不限。"
+      },
+      "judge_timeout_seconds": {
+        "description": "模型判定超时（秒）",
+        "type": "float",
+        "default": 8.0,
+        "hint": "超时按延续处理，不影响正常回复。"
+      },
+      "judge_min_confidence": {
+        "description": "新话题最低置信度",
+        "type": "float",
+        "default": 0.6,
+        "hint": "低于它一律按延续，宁可不切。"
+      },
+      "detect_in_hook_enabled": {
+        "description": "请求钩子兜底判定",
+        "type": "bool",
+        "default": true,
+        "hint": "消息入口被更高优先级插件/内置会话控制拦截时，仍在 LLM 请求前判定并注入提示。"
       }
     }
   },
