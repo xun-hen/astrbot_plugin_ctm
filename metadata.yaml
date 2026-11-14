@@ -14,13 +14,13 @@ desc: |-
   - 归档异步执行，失败重试并落 `archive_failures`，不阻塞下一轮；
   - 默认 SQLite 自包含，插件详情页提供只读运行状态面板。
 
-  当前为 v0.5.1：消息聚合、双层话题判定、长期记忆、话题软边界与关系状态均已可运行；
+  当前为 v0.5.2：消息聚合、双层话题判定、长期记忆、话题软边界与关系状态均已可运行；
   v0.4.1 修复了 v0.4.0 在真机上"加载成功但一条消息都不处理"的 handler 绑定问题；
   v0.4.2 增加自检（`/ctm doctor` + 状态页红条）：白名单 / handler 绑定 / 入口心跳 / DB 一屏看清；
   常见坑与解决办法见仓库 docs/TROUBLESHOOTING.md。
   v0.5.0：自适应防抖（按用户节奏调合并窗口）+ 切分时用整段对话生成四段式摘要。
   记忆按用户/群聊隔离，默认 SQLite 自包含，零第三方依赖。
-version: v0.5.1
+version: v0.5.2
 author: xun-hen
 repo: https://github.com/xun-hen/astrbot_plugin_ctm
 astrbot_version: ">=4.26"

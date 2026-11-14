@@ -42,7 +42,7 @@ class Store:
             db_path: 数据库绝对路径。
         """
         self._path = Path(db_path)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
 
     # ------------------------------------------------------------------ 生命周期
@@ -54,9 +54,20 @@ class Store:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(self._path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA foreign_keys=ON")
+            # busy_timeout 必须在切 WAL 之前设置，否则热重载时旧实例还占着库，
+            # `PRAGMA journal_mode=WAL` 会立刻抛 database is locked，
+            # 新实例就卡在"库不可用"状态（真机踩过）。
             conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            for attempt in range(3):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt >= 2:
+                        conn.close()
+                        raise
+                    time.sleep(0.2 * (attempt + 1))
             self._conn = conn
             self.migrate()
 
@@ -660,6 +671,16 @@ class Store:
         return time.time()
 
     def _require(self) -> sqlite3.Connection:
+        """返回连接；若启动时没能连上（例如库被上一个实例短暂占用），这里再试一次。
+
+        自愈很重要：`initialize()` 失败后插件不会重启，之前只能等用户重载；
+        现在下一条消息走到这里就能把库补上（RLock 允许在持锁块内再取锁）。
+        """
+        if self._conn is None:
+            try:
+                self.init()
+            except sqlite3.Error:
+                raise
         if self._conn is None:
             raise sqlite3.Error("store is not initialized")
         return self._conn

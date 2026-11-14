@@ -48,6 +48,15 @@ from .ctm.topic_state import TopicStateMachine
 
 MESSAGE_PRIORITY = 1000
 DECISION_EXTRA = "ctm_decision"
+
+#: 当前活跃实例。**只给页面 API 用**（重载后路由还指着旧对象，会看到陈旧状态）。
+#: 注意：handler 仍然是类方法，不依赖这个指针（v0.4.0 的坑）。
+_ACTIVE_PLUGIN: "CtmPlugin | None" = None
+
+
+def active_plugin() -> "CtmPlugin | None":
+    """返回当前活跃实例；供页面路由在每次请求时解析。"""
+    return _ACTIVE_PLUGIN
 #: 归档摘要用的会话轮次窗口（太长的旧话题只保留最近这些轮，避免摘要 prompt 爆掉）
 TRANSCRIPT_MAX_TURNS = 24
 TRANSCRIPT_MAX_CHARS = 4000
@@ -74,6 +83,8 @@ class CtmPlugin(Star):
             config: 插件配置（通常是 `AstrBotConfig`，dict 子类）。
         """
         super().__init__(context)
+        global _ACTIVE_PLUGIN
+        _ACTIVE_PLUGIN = self
         self.cfg: Config = load_config(config)
         self.diag = Diag()
         self.data_dir = Path(self._data_dir())
@@ -321,7 +332,7 @@ class CtmPlugin(Star):
         try:
             from .ctm.web_api import register_page_api
 
-            register_page_api(self.context, self)
+            register_page_api(self.context, self, provider=active_plugin)
         except Exception as exc:  # noqa: BLE001 - 页面不可用不能拖垮插件
             logger.warning(f"[{PLUGIN_NAME}] 页面后端注册失败：{exc}")
         logger.info(
@@ -336,7 +347,10 @@ class CtmPlugin(Star):
         之后所有 reload / 禁用 / 热更新都会一直超时（真机上踩过：
         归档或长期记忆 worker 卡在 provider 请求里，`await worker` 永不返回）。
         """
+        global _ACTIVE_PLUGIN
         self._started = False
+        if _ACTIVE_PLUGIN is self:
+            _ACTIVE_PLUGIN = None
         try:
             self.aggregation.close()
         except Exception:  # noqa: BLE001

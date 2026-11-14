@@ -52,15 +52,35 @@ def _decode_decision(raw: str | None) -> dict[str, Any]:
 
 
 class PageApi:
-    """页面只读视图。"""
+    """页面只读视图。
 
-    def __init__(self, plugin: Any) -> None:
+    路由只在插件第一次加载时注册一次，而 AstrBot 重载会创建**新实例**；
+    若这里钉死旧实例，重载后页面/自检会一直显示旧状态（真机踩过：
+    新实例建库失败，但页面读的是旧实例，看起来"没变化"）。
+    所以这里每次请求都通过 `provider` 解析当前实例。
+    """
+
+    def __init__(self, plugin: Any, provider: Any = None) -> None:
         """初始化。
 
         Args:
-            plugin: CTM 插件实例（只读其 cfg / diag / store / lt / aggregation）。
+            plugin: 兜底插件实例。
+            provider: 无参回调，返回当前活跃实例（可为 None）。
         """
-        self.plugin = plugin
+        self._fallback = plugin
+        self._provider = provider
+
+    @property
+    def plugin(self) -> Any:
+        """解析当前活跃实例；解析失败时退回注册时的实例。"""
+        if self._provider is not None:
+            try:
+                current = self._provider()
+            except Exception:  # noqa: BLE001
+                current = None
+            if current is not None:
+                return current
+        return self._fallback
 
     async def api_overview(self) -> Any:
         """概览：生效配置、诊断计数、表计数、聚合/长期记忆状态。"""
@@ -210,12 +230,13 @@ ROUTES = (
 )
 
 
-def register_page_api(context: Any, plugin: Any) -> bool:
+def register_page_api(context: Any, plugin: Any, provider: Any = None) -> bool:
     """注册页面只读路由；失败只告警，不影响插件主流程。
 
     Args:
         context: AstrBot 插件上下文。
-        plugin: CTM 插件实例。
+        plugin: CTM 插件实例（注册时的兜底）。
+        provider: 可选，返回当前活跃实例的回调；重载后页面仍能读到新实例。
 
     Returns:
         是否注册成功。
@@ -223,7 +244,7 @@ def register_page_api(context: Any, plugin: Any) -> bool:
     if not WEB_API_AVAILABLE:
         logger.info(f"[{PLUGIN_NAME}] 页面后端未注册：当前 AstrBot 不支持 api.web")
         return False
-    api = PageApi(plugin)
+    api = PageApi(plugin, provider=provider)
     try:
         for route, handler_name, methods, desc in ROUTES:
             context.register_web_api(

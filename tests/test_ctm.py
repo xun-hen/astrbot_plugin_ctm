@@ -137,6 +137,32 @@ class ConfigTest(unittest.TestCase):
         self.assertLessEqual(cfg.memory.injection_budget_tokens, 8000)
 
 
+class StoreSelfHealTest(unittest.TestCase):
+    def test_require_reinitializes_after_failed_init(self) -> None:
+        tmp, db_path = _tmp_db()
+        try:
+            store = Store(db_path)
+            self.assertFalse(store.health()["ok"], "未初始化时 health 应为 False")
+            store.ensure_session("s1", "u1")  # 应自愈并写入
+            self.assertTrue(store.health()["ok"])
+            self.assertEqual(store.stats()["sessions"], 1)
+            store.close()
+        finally:
+            tmp.cleanup()
+
+    def test_close_then_use_reopens(self) -> None:
+        tmp, db_path = _tmp_db()
+        try:
+            store = Store(db_path)
+            store.init()
+            store.close()
+            store.ensure_session("s2", "u2")
+            self.assertEqual(store.stats()["sessions"], 1)
+            store.close()
+        finally:
+            tmp.cleanup()
+
+
 class TextSimTest(unittest.TestCase):
     def test_similarity(self) -> None:
         self.assertGreater(
