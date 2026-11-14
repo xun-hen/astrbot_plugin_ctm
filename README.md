@@ -143,6 +143,21 @@ python tests/eval_topic_detection.py --db ~/.astrbot/data/data_v4.db
 | 同装冲突 | **不要**与 `astrbot_plugin_msg_aggregator` / `astrbot_plugin_topic_router_pro` 同装：三者都抢 `priority=1000`，会互相抢占事件、重复判定 |
 | 装完第一步 | 发 `/ctm doctor`，六项全 `ok` 才算真正生效（白名单是最容易漏的一项） |
 
+## 常见坑（上架前必读）
+
+按踩坑概率排序，完整判定步骤与解决办法见 **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**。
+
+| 坑 | 现象 | 解决办法 |
+| --- | --- | --- |
+| 不在全局 `plugin_set` 白名单 | 已启用、能回复，但插件零日志零数据 | WebUI → 配置 → 插件 → 把 `astrbot_plugin_ctm` 加入 `plugin_set`（或设 `["*"]`） |
+| 与同 `priority=1000` 插件同装 | 消息被合并两次/判定重复/偶尔收不到 | 只留一个消息入口插件 |
+| 会话级关闭 | 只有某个会话不工作 | 该会话发 `/ctm topic on` |
+| 总开关或模式关着 | 完全不动 | 开 `basic.enabled`，`topic.mode` 改 `hint` |
+| 数据库在网络盘/无写权限 | 时好时坏、`database is locked` | `basic.db_path` 指到本地可写目录 |
+| AstrBot < 4.26 | 页面打不开 | 升级；命令能力不受影响 |
+
+装完第一件事：`/ctm doctor`，六项全 `ok` 才算生效。
+
 ## 排障
 
 插件"看起来正常但完全没反应"时，**先跑 `/ctm doctor`**（或看插件页顶部的

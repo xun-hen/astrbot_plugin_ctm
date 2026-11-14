@@ -19,9 +19,21 @@
 - **状态页自检卡片**：页面顶部红条 + 逐项清单，5 秒刷新；阻断项变红、警告变黄。
   `/astrbot_plugin_ctm/selfcheck` 与页面、命令共用同一份判定（不会出现"页面绿、
   实际死"的两套逻辑）。
+- 补上两条"声明了但从未触发"的日志：`WARN_PROMPT_GROWTH_CAPPED`（注入被增幅上限
+  裁剪，带裁剪前后字符数）与 `WARN_BUDGET_OVERFLOW`（预算装不下任何一条）；
+  渲染后为空时记 `DEBUG_SKIP reason=empty_injection`，不再静默。
 - 新增心跳：`diag.last_entry_at / last_decision_at`，判据是"入口 0 次 + 请求钩子
   有次数 = 派发被拦"，比单纯看"有没有日志"可靠。
 - 顶部指标新增"入口消息""跳过/无决策"，直接看 `entries` 与 `skips`。
+
+### 文档与资源
+
+- 新增 `logo.png`（256×256，1:1）：深蓝紫底 + 三层话题卡 + 青色高亮条目，
+  48px 缩小仍可辨认；AstrBot 会读取仓库根的 `logo.png` 作为插件图标。
+- 新增 `docs/TROUBLESHOOTING.md`：按踩坑概率排序的 10 个坑，每坑给出
+  「现象 / 原因 / 判定 / 解决 / 验证」；附日志码与 `DEBUG_SKIP reason` 速查表、
+  一页速查表与反馈模板。
+- README 增「常见坑（上架前必读）」速查表 + 兼容性表。
 
 ### 测试
 

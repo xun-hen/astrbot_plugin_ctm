@@ -16,7 +16,8 @@ desc: |-
 
   当前为 v0.4.2：消息聚合、双层话题判定、长期记忆、话题软边界与关系状态均已可运行；
   v0.4.1 修复了 v0.4.0 在真机上"加载成功但一条消息都不处理"的 handler 绑定问题；
-  v0.4.2 增加自检（`/ctm doctor` + 状态页红条）：白名单 / handler 绑定 / 入口心跳 / DB 一屏看清。
+  v0.4.2 增加自检（`/ctm doctor` + 状态页红条）：白名单 / handler 绑定 / 入口心跳 / DB 一屏看清；
+  常见坑与解决办法见仓库 docs/TROUBLESHOOTING.md。
   记忆按用户/群聊隔离，默认 SQLite 自包含，零第三方依赖。
 version: v0.4.2
 author: xun-hen
@@ -41,6 +42,8 @@ help: |-
   /ctm longterm list   长期记忆列表
   /ctm longterm delete <id前缀>  删除长期记忆
   /ctm health          适配器 / DB / 队列健康检查
+  /ctm doctor          自检：白名单 / handler 绑定 / 入口心跳 / DB / 版本
+                       装完先跑这条，六项全 OK 才算生效
   /ctm status          含聚合与判定状态
   /ctm export          导出本会话数据
 tags_tip: 默认配置即可用；建议先以 auto_switch_strategy=soft 观察一周再调阈值。

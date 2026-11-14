@@ -613,15 +613,35 @@ class CtmPlugin(Star):
     ) -> None:
         """把决策渲染成 Prompt 块并追加（唯一渲染点）。"""
         try:
-            payload = self.builder.build(decision)
+            built = self.builder.build(decision)
             payload = self.builder.cap_by_ratio(
-                payload,
+                built,
                 req.system_prompt or "",
                 self.cfg.injection.max_prompt_growth_ratio,
             )
         except Exception as exc:  # noqa: BLE001
             self.diag.injection_errors += 1
             log_event(LogCode.INJECTION_ERROR, session_id=session_id, error=str(exc))
+            return
+        if payload != built:
+            # 注入被增幅上限裁剪：这不是故障，但要让"为什么只有这么点内容"可查。
+            log_event(
+                LogCode.PROMPT_GROWTH_CAPPED,
+                session_id=session_id,
+                before_chars=len(built),
+                after_chars=len(payload),
+                ratio=self.cfg.injection.max_prompt_growth_ratio,
+            )
+        if decision.dropped_items and not decision.recall_items:
+            # 预算装不下任何一条：把预算调大或降低召回条数。
+            log_event(
+                LogCode.BUDGET_OVERFLOW,
+                session_id=session_id,
+                dropped=len(decision.dropped_items),
+                budget=decision.injection_budget,
+            )
+        if not payload.strip():
+            self._skip("empty_injection", session_id=session_id)
             return
         if req.system_prompt:
             req.system_prompt = f"{req.system_prompt}\n{payload}"
