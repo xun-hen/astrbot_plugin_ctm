@@ -16,6 +16,21 @@
 - 新增启动自检 `ctm/bindings.py` + `CtmPlugin._verify_handler_binding()`：核对每个 handler
   是否已注册、是否绑定到本实例；异常时打 `WARN_HANDLER_BINDING` 并在日志里点明后果。
 
+### 修复（真机现场实测发现的第二个门禁）
+
+- 同一台设备上 `astrbot_plugin_ctm` **不在 AstrBot 全局 `plugin_set` 白名单**里
+  （白名单是 `["*"]`=全部 或 显式列表）。不在名单内的插件，handler 会在
+  `waking_check` 阶段被直接丢弃（只有 DEBUG 日志），表现与"插件没装"完全一样。
+  CTM 是 11-13 新装的，而白名单还停在装 topic_router_pro 那天的旧列表。
+- 新增启动自检 `_verify_plugin_set()`：不在白名单时打 `WARN_PLUGIN_SET`，
+  并在日志里直接给出修复路径（WebUI → 配置 → 插件 → 加入 plugin_set）。
+  `/ctm health` 也会打印 `plugin_set: ok|not_listed|empty|unknown`。
+
+> 两个根因是**串联**的：先过 `plugin_set` 白名单，再过 handler 绑定。只修一个
+> 仍然不会工作——真机上先补白名单、再升级到 v0.4.1 后，`entries/decisions/
+> sessions/topics/turn_logs` 才从 0 变成 1。排查顺序建议：白名单 → 绑定自检 →
+> `INFO_ENTRY` / `DEBUG_SKIP`。
+
 ### 新增（让"静默失效"这一类故障以后一定留痕）
 
 - 入口 `INFO_ENTRY`：每条消息记 `session_id / text_len / mode / enabled / aggregate`。

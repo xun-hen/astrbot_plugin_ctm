@@ -31,6 +31,14 @@ class _FakeContext:
     conversation_manager = None
     provider_manager = None
 
+    def __init__(self, plugin_set=None) -> None:
+        self._plugin_set = plugin_set
+
+    def get_config(self, umo=None):
+        if self._plugin_set is None:
+            return None
+        return {"plugin_set": self._plugin_set}
+
     def register_web_api(self, *args, **kwargs):
         return None
 
@@ -232,6 +240,32 @@ class EntryObservabilityTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin.on_llm_request(_FakeEvent(), _FakeRequest())
         self.assertIn("DEBUG_LLM_REQUEST", self.codes())
         self.assertEqual(self.plugin.diag.llm_requests, 1)
+
+
+@unittest.skipUnless(HAS_ASTRBOT, "AstrBot runtime not installed")
+class PluginSetSelfCheckTest(unittest.TestCase):
+    """`plugin_set` 白名单是第二个静默门禁（真机现场）。"""
+
+    def _state(self, plugin_set):
+        import astrbot_plugin_ctm.main as plugin_main
+
+        plugin = plugin_main.CtmPlugin(_FakeContext(plugin_set), {})
+        return plugin._verify_plugin_set()  # noqa: SLF001
+
+    def test_star_means_all_enabled(self) -> None:
+        self.assertEqual(self._state(["*"]), "ok")
+
+    def test_listed_plugin_is_ok(self) -> None:
+        self.assertEqual(self._state(["other", "astrbot_plugin_ctm"]), "ok")
+
+    def test_missing_plugin_is_not_listed(self) -> None:
+        self.assertEqual(self._state(["other", "another"]), "not_listed")
+
+    def test_empty_list_blocks_everything(self) -> None:
+        self.assertEqual(self._state([]), "empty")
+
+    def test_no_context_config_is_unknown(self) -> None:
+        self.assertEqual(self._state(None), "unknown")
 
 
 if __name__ == "__main__":

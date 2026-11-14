@@ -91,6 +91,7 @@ class CtmPlugin(Star):
         self._topic_disabled: set[str] = set()
         self._fallback_reason = "not_tried"
         self._handler_binding: dict[str, str] = {}
+        self._plugin_set_state = "unknown"
         self.aggregation = Aggregator(
             enabled=self.cfg.topic.aggregation_enabled,
             debounce_seconds=self.cfg.topic.aggregation_debounce_seconds,
@@ -164,6 +165,33 @@ class CtmPlugin(Star):
         async for result in self.on_command(event):
             yield result
 
+    def _verify_plugin_set(self) -> str:
+        """自检：本插件是否在 AstrBot 全局 `plugin_set` 白名单里。
+
+        `plugin_set` 是**全局白名单**（`["*"]` 表示全部启用，空列表表示全不启用）。
+        不在名单里的插件，handler 会在 `waking_check` 阶段被直接丢弃（只有 DEBUG
+        日志），表现与"插件没装"完全一样：零日志、零数据、回复正常。这是真机上
+        除 handler 绑定之外的第二个静默门禁。
+
+        Returns:
+            `ok` / `not_listed` / `empty` / `unknown`。
+        """
+        try:
+            getter = getattr(self.context, "get_config", None)
+            raw = getter() if callable(getter) else None
+        except Exception:  # noqa: BLE001 - 自检不能影响插件运行
+            return "unknown"
+        if not isinstance(raw, dict):
+            return "unknown"
+        plugin_set = raw.get("plugin_set")
+        if not isinstance(plugin_set, list):
+            return "unknown"
+        if "*" in plugin_set:
+            return "ok"
+        if not plugin_set:
+            return "empty"
+        return "ok" if PLUGIN_NAME in plugin_set else "not_listed"
+
     def _verify_handler_binding(self) -> dict[str, str]:
         """启动自检：handler 是否都已注册并被框架绑定到本实例。
 
@@ -210,6 +238,20 @@ class CtmPlugin(Star):
         """插件加载：自检 handler 绑定、建库、起归档 worker、起长期记忆 worker。"""
         configure(self._emit_log)
         self._handler_binding = self._verify_handler_binding()
+        self._plugin_set_state = self._verify_plugin_set()
+        if self._plugin_set_state in ("not_listed", "empty"):
+            logger.warning(
+                f"[{PLUGIN_NAME}] 本插件不在 AstrBot 全局 plugin_set 白名单里"
+                f"（当前状态 {self._plugin_set_state}）。白名单是全局开关，"
+                "不在名单内的插件 handler 会在消息派发阶段被静默丢弃："
+                "表现为零日志、零数据、回复正常。"
+                f"修复：WebUI → 配置 → 插件 → 把 {PLUGIN_NAME} 加入 plugin_set"
+                "（或把 plugin_set 设为 [\"*\"]）。"
+            )
+            log_event(
+                LogCode.PLUGIN_SET,
+                reason=self._plugin_set_state,
+            )
         if not self.cfg.enabled:
             logger.warning(
                 f"[{PLUGIN_NAME}] 配置 basic.enabled=false，插件不工作"

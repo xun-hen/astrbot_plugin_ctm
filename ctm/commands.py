@@ -278,6 +278,7 @@ class CtmCommands:
             f"archive queue: {plugin.archiver._queue.qsize()}",  # noqa: SLF001
             f"longterm: {'ok' if plugin.lt is not None else 'off'}",
             f"handlers: {describe_binding(binding)}",
+            f"plugin_set: {getattr(plugin, '_plugin_set_state', 'unknown')}",
             f"入口: entries={diag['entries']} decisions={diag['decisions']} "
             f"skips={diag['skips']} no_decision={diag['no_decision']} "
             f"llm_requests={diag['llm_requests']}",

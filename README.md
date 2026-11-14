@@ -136,6 +136,9 @@ python tests/eval_topic_detection.py --db ~/.astrbot/data/data_v4.db
 
 插件"看起来正常但完全没反应"时，按顺序看三处：
 
+0. **全局白名单**：`/ctm health` 的 `plugin_set` 一行，或搜 `WARN_PLUGIN_SET`。
+   AstrBot 的 `plugin_set` 是全局白名单（`["*"]` = 全部），**不在名单里的插件
+   handler 会被静默丢弃**，症状与"插件没装"完全一样。新装插件最容易踩。
 1. **启动自检**：搜日志 `handler 绑定自检`。若出现
    `WARN_HANDLER_BINDING ... handler 必须是本插件的类方法`，说明 handler
    被写成了模块级函数——框架会把实例 partial 到第一个位置参数，派发时
