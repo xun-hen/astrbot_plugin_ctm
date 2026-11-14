@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from . import selfcheck
 from .bindings import describe as describe_binding
 from .injection import InjectionBuilder
 from .observability import LogCode, log_event
@@ -23,6 +24,8 @@ USAGE = """CTM 管理命令：
 /ctm export              导出本会话 JSON
 /ctm replay <turn_id>    回放某轮决策与注入内容
 /ctm health              适配器 / DB / 队列健康检查
+/ctm doctor              自检：白名单 / handler 绑定 / 入口心跳 / DB / 版本
+/ctm 自检                同上（中文别名）
 """
 
 
@@ -65,6 +68,8 @@ class CtmCommands:
             return await self.replay(event, args)
         if command == "health":
             return await self.health(event, args)
+        if command in ("doctor", "selfcheck", "check", "自检"):
+            return await self.doctor(event, args)
         return USAGE
 
     async def status(self, event: Any, args: list[str]) -> str:
@@ -286,9 +291,15 @@ class CtmCommands:
         if diag["entries"] == 0 and diag["llm_requests"] > 0:
             lines.append(
                 "⚠ 只有请求钩子被调用、消息入口从未进入：典型原因是同优先级的"
-                "其他插件 stop_event() 抢占了事件，或本插件会话级被禁用。"
+                "其他插件 stop_event() 抢占了事件，或本插件被全局白名单/会话级禁用。"
             )
         return "\n".join(lines)
+
+    async def doctor(self, event: Any, args: list[str]) -> str:
+        """`/ctm doctor`：一次性体检"插件到底有没有在工作"。"""
+        session_id = str(getattr(event, "unified_msg_origin", "") or "")
+        result = selfcheck.run(self._plugin, session_id)
+        return selfcheck.format_text(result)
 
 
 def _int_arg(args: list[str], default: int) -> int:

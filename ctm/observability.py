@@ -103,8 +103,11 @@ class Diag:
     llm_requests: int = 0
     skips: int = 0
     aggregation_anomalies: int = 0
+    # 心跳：最近一次入口消息 / 决策的时间戳（Unix 秒），供自检判断"多久没动静"。
+    last_entry_at: float = 0.0
+    last_decision_at: float = 0.0
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | float]:
         """导出为可 JSON 序列化的字典。"""
         return asdict(self)
 

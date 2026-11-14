@@ -14,11 +14,13 @@ const el = {
   fatal: $("fatal"),
   auto: $("auto"),
   refresh: $("refresh"),
+  entries: $("c-entries"),
   turns: $("c-turns"),
   decisions: $("c-decisions"),
   tokens: $("c-tokens"),
   dropped: $("c-dropped"),
-  preempted: $("c-preempted"),
+  skips: $("c-skips"),
+  nod: $("c-nod"),
   lt: $("c-lt"),
   active: $("c-active"),
   topics: $("c-topics"),
@@ -34,6 +36,9 @@ const el = {
   memoryRows: $("memory-rows"),
   memoryEmpty: $("memory-empty"),
   health: $("health"),
+  scSummary: $("selfcheck-summary"),
+  scBanner: $("selfcheck-banner"),
+  scList: $("selfcheck-list"),
 };
 
 let timer = null;
@@ -96,11 +101,13 @@ function toggleEmpty(emptyNode, hasRows) {
 
 function renderOverview(data) {
   const diag = data.diag || {};
+  el.entries.textContent = int(diag.entries);
   el.turns.textContent = int(diag.turns);
   el.decisions.textContent = int(diag.decisions);
   el.tokens.textContent = int(diag.injected_tokens);
   el.dropped.textContent = int(diag.dropped_items);
-  el.preempted.textContent = int(diag.no_decision);
+  el.skips.textContent = int(diag.skips);
+  el.nod.textContent = `无决策 ${int(diag.no_decision)}`;
   el.lt.textContent = int((data.longterm || {}).items || 0);
   const rounds = ((data.aggregation || {}).active || []).length;
   el.active.textContent = int(rounds);
@@ -127,6 +134,64 @@ function renderOverview(data) {
   ]);
 
   renderActive(agg.active || []);
+  renderSelfcheck(data.selfcheck || {});
+}
+
+const LEVEL_TAGS = { ok: "OK", info: "提示", warn: "警告", error: "阻断" };
+
+function renderSelfcheck(sc) {
+  const items = sc.items || [];
+  clear(el.scList);
+  for (const item of items) {
+    const li = document.createElement("li");
+    li.className = String(item.level || "info");
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = LEVEL_TAGS[item.level] || "?";
+    const main = document.createElement("div");
+    main.className = "check-main";
+    const title = document.createElement("div");
+    title.className = "check-title";
+    title.textContent = item.title || item.id || "";
+    const detail = document.createElement("div");
+    detail.className = "check-detail";
+    detail.textContent = item.detail || "";
+    main.append(title, detail);
+    if (item.fix) {
+      const fix = document.createElement("div");
+      fix.className = "check-fix";
+      fix.textContent = `→ ${item.fix}`;
+      main.appendChild(fix);
+    }
+    li.append(tag, main);
+    el.scList.appendChild(li);
+  }
+
+  const summary = sc.summary || {};
+  el.scSummary.textContent = items.length
+    ? `阻断 ${summary.error || 0} / 警告 ${summary.warn || 0} / 正常 ${summary.ok || 0}`
+    : "无数据";
+
+  const errors = items.filter((item) => item.level === "error");
+  const warns = items.filter((item) => item.level === "warn");
+  const NL = String.fromCharCode(10);
+  if (errors.length) {
+    el.scBanner.hidden = false;
+    el.scBanner.className = "banner bad";
+    el.scBanner.textContent =
+      "发现 " + errors.length + " 个阻断项，插件当前不会生效：" + NL +
+      errors.map((item) => "· " + item.title + "：" + item.detail).join(NL);
+  } else if (warns.length) {
+    el.scBanner.hidden = false;
+    el.scBanner.className = "banner warn";
+    el.scBanner.textContent =
+      "有 " + warns.length + " 个警告：" + NL +
+      warns.map((item) => "· " + item.title + "：" + item.detail).join(NL);
+  } else {
+    el.scBanner.hidden = false;
+    el.scBanner.className = "banner good";
+    el.scBanner.textContent = "链路正常：消息入口、handler 绑定、白名单与数据库都通过。";
+  }
 }
 
 function renderActive(rows) {

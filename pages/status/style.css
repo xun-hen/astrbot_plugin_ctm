@@ -87,3 +87,54 @@ td.wrap { max-width: 420px; overflow-wrap: anywhere; }
 .pill.ok { color: var(--ok); border-color: var(--ok); }
 .pill.warn { color: var(--warn); border-color: var(--warn); }
 .pill.bad { color: var(--bad); border-color: var(--bad); }
+
+/* 自检 */
+.selfcheck .banner {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.selfcheck .banner.bad {
+  background: rgba(220, 60, 60, 0.12);
+  border: 1px solid rgba(220, 60, 60, 0.45);
+  color: #b3261e;
+}
+.selfcheck .banner.warn {
+  background: rgba(230, 160, 20, 0.12);
+  border: 1px solid rgba(230, 160, 20, 0.45);
+  color: #8a5a00;
+}
+.selfcheck .banner.good {
+  background: rgba(30, 160, 90, 0.10);
+  border: 1px solid rgba(30, 160, 90, 0.35);
+  color: #1b6b3a;
+}
+.checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.checklist li {
+  display: grid;
+  grid-template-columns: 54px 1fr;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.06);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.checklist .tag { font-weight: 700; font-size: 12px; align-self: start; }
+.checklist .check-main { min-width: 0; }
+.checklist .check-title { font-weight: 600; }
+.checklist .check-detail { opacity: 0.85; }
+.checklist .check-fix { margin-top: 2px; opacity: 0.9; }
+.checklist li.ok .tag { color: #1b6b3a; }
+.checklist li.info .tag { color: #4a6fa5; }
+.checklist li.warn .tag { color: #8a5a00; }
+.checklist li.error .tag { color: #b3261e; }

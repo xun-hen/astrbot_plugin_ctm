@@ -92,6 +92,7 @@ class CtmPlugin(Star):
         self._fallback_reason = "not_tried"
         self._handler_binding: dict[str, str] = {}
         self._plugin_set_state = "unknown"
+        self._started_at = 0.0
         self.aggregation = Aggregator(
             enabled=self.cfg.topic.aggregation_enabled,
             debounce_seconds=self.cfg.topic.aggregation_debounce_seconds,
@@ -237,6 +238,7 @@ class CtmPlugin(Star):
     async def initialize(self) -> None:
         """插件加载：自检 handler 绑定、建库、起归档 worker、起长期记忆 worker。"""
         configure(self._emit_log)
+        self._started_at = time.time()
         self._handler_binding = self._verify_handler_binding()
         self._plugin_set_state = self._verify_plugin_set()
         if self._plugin_set_state in ("not_listed", "empty"):
@@ -328,6 +330,7 @@ class CtmPlugin(Star):
         """
         session_key = str(getattr(event, "unified_msg_origin", "") or "")
         self.diag.entries += 1
+        self.diag.last_entry_at = time.time()
         log_event(
             LogCode.ENTRY,
             session_id=session_key,
@@ -449,6 +452,7 @@ class CtmPlugin(Star):
         event.set_extra(DECISION_EXTRA, decision)
         self.diag.turns += 1
         self.diag.decisions += 1
+        self.diag.last_decision_at = time.time()
         self.diag.soft_switches += int(decision.topic_action == TopicAction.SOFT_BOUNDARY)
         self.diag.hard_switches += int(
             decision.topic_action == TopicAction.HARD_SWITCH or switched

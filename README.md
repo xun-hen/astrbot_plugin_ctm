@@ -1,6 +1,6 @@
 # 对话认知中枢（Cognitive Turn Manager）
 
-> **状态：v0.4.1（可运行）**。长期记忆（跨会话抽取 / 召回 / 管理）、话题软边界、
+> **状态：v0.4.2（可运行）**。长期记忆（跨会话抽取 / 召回 / 管理）、话题软边界、
 > 关系状态与异步归档已实现；`on_message → on_llm_request → on_llm_response`
 > 全链路可用，默认配置即可工作，核心零第三方依赖。
 
@@ -25,6 +25,7 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 | 异步归档 | 单 worker 串行写 SQLite，失败重试并落 `archive_failures` |
 | 可视化页面 | 插件详情页「运行状态」：核心指标、生效配置、聚合进行中、最近决策/话题/记忆、健康检查（只读） |
 | 可管理 | `/ctm` 命令 + `memory_search / memory_save / memory_forget` 工具 |
+| 自检 | `/ctm doctor` + 状态页红条：白名单 / handler 绑定 / 入口心跳 / DB / 版本一屏看清 |
 | 可回退 | `basic.enabled=false` 完全停用；长期记忆可单独关闭 |
 
 ## 安装
@@ -134,7 +135,8 @@ python tests/eval_topic_detection.py --db ~/.astrbot/data/data_v4.db
 
 ## 排障
 
-插件"看起来正常但完全没反应"时，按顺序看三处：
+插件"看起来正常但完全没反应"时，**先跑 `/ctm doctor`**（或看插件页顶部的
+自检红条），它会把下面每一道门禁逐条判定并给出修复动作。也可以按顺序人工看：
 
 0. **全局白名单**：`/ctm health` 的 `plugin_set` 一行，或搜 `WARN_PLUGIN_SET`。
    AstrBot 的 `plugin_set` 是全局白名单（`["*"]` = 全部），**不在名单里的插件

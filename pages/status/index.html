@@ -21,12 +21,19 @@
 
     <p id="fatal" class="fatal" hidden></p>
 
+    <section class="panel selfcheck" id="selfcheck-panel">
+      <h2>自检 <span class="muted" id="selfcheck-summary">检查中…</span></h2>
+      <p id="selfcheck-banner" class="banner" hidden></p>
+      <ul class="checklist" id="selfcheck-list"></ul>
+    </section>
+
     <section class="cards" aria-label="核心指标">
+      <div class="card"><span class="card-label">入口消息</span><strong class="card-value" id="c-entries">–</strong><span class="card-hint">条</span></div>
       <div class="card"><span class="card-label">参与判定</span><strong class="card-value" id="c-turns">–</strong><span class="card-hint">轮</span></div>
       <div class="card"><span class="card-label">决策产出</span><strong class="card-value" id="c-decisions">–</strong><span class="card-hint">次</span></div>
       <div class="card"><span class="card-label">注入 Tokens</span><strong class="card-value" id="c-tokens">–</strong><span class="card-hint">累计估算</span></div>
       <div class="card"><span class="card-label">预算丢弃</span><strong class="card-value" id="c-dropped">–</strong><span class="card-hint">条</span></div>
-      <div class="card"><span class="card-label">抢占兜底</span><strong class="card-value" id="c-preempted">–</strong><span class="card-hint">次</span></div>
+      <div class="card"><span class="card-label">跳过 / 无决策</span><strong class="card-value" id="c-skips">–</strong><span class="card-hint" id="c-nod">–</span></div>
       <div class="card"><span class="card-label">长期记忆</span><strong class="card-value" id="c-lt">–</strong><span class="card-hint">条</span></div>
       <div class="card"><span class="card-label">聚合进行中</span><strong class="card-value" id="c-active">–</strong><span class="card-hint">轮</span></div>
       <div class="card"><span class="card-label">话题 / 会话</span><strong class="card-value" id="c-topics">–</strong><span class="card-hint" id="c-sessions">–</span></div>
@@ -89,7 +96,7 @@
     </section>
 
     <footer class="foot muted">
-      页面只读；数据来自本机 SQLite。自动刷新每 5 秒一次。
+      页面只读；数据来自本机 SQLite。自检与 <code>/ctm doctor</code> 共用同一份判定。自动刷新每 5 秒一次。
     </footer>
 
     <script type="module" src="./app.js"></script>

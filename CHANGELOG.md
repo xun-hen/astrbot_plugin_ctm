@@ -1,5 +1,34 @@
 # CHANGELOG
 
+## v0.4.2
+
+### 新增：自检（失效后**能看见**）
+
+一次历史故障复盘得出：AstrBot 插件可以"加载成功、启动日志正常、配置生效"却一条消息
+都不处理，且全程没有 ERROR。这类故障有四道静默门禁，v0.4.2 把它们收拢成一份清单：
+
+1. 全局 `plugin_set` 白名单未包含本插件（框架在 `waking_check` 直接丢弃 handler）；
+2. handler 被写成模块级函数（框架 partial 绑实例后 TypeError 被 `call_handler` 吞）；
+3. 同优先级其他插件 `stop_event()` 抢占事件；
+4. `basic.enabled=false` / `topic.mode=off` / 会话被 `/ctm topic off`。
+
+- `ctm/selfcheck.py`：`run(plugin)` 产出 `{ok, summary, items[]}`，每项带
+  `level = ok|info|warn|error`、人话说明与 `fix` 修复动作；单项异常不影响其余检查。
+- **`/ctm doctor`**（别名 `/ctm selfcheck` / `/ctm check` / `/ctm 自检`）：
+  文本体检，`[XX]` 就是"为什么不工作"，并直接给出下一步。
+- **状态页自检卡片**：页面顶部红条 + 逐项清单，5 秒刷新；阻断项变红、警告变黄。
+  `/astrbot_plugin_ctm/selfcheck` 与页面、命令共用同一份判定（不会出现"页面绿、
+  实际死"的两套逻辑）。
+- 新增心跳：`diag.last_entry_at / last_decision_at`，判据是"入口 0 次 + 请求钩子
+  有次数 = 派发被拦"，比单纯看"有没有日志"可靠。
+- 顶部指标新增"入口消息""跳过/无决策"，直接看 `entries` 与 `skips`。
+
+### 测试
+
+- 新增 `tests/test_selfcheck.py`（14 项，纯标准库替身）：白名单缺失/空、派发被拦、
+  handler unbound、DB 失败、聚合异常、会话关闭、坏插件不抛异常、文本渲染。
+- 全量 **67 tests OK**（无 AstrBot 环境时 16 项条件跳过）。
+
 ## v0.4.1
 
 ### 修复（**重要：v0.4.0 在真机上完全静默、一条消息都不处理**）

@@ -14,6 +14,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ..config import PLUGIN_NAME
+from . import selfcheck
 
 try:  # 老版本没有页面 API 时整体降级
     from astrbot.api.web import error_response, json_response, request
@@ -106,6 +107,7 @@ class PageApi:
                 "diag": diag,
                 "tables": plugin.store.stats(),
                 "db": plugin.store.health(),
+                "selfcheck": selfcheck.run(plugin),
             }
         )
 
@@ -185,8 +187,13 @@ class PageApi:
                     "enabled": plugin.lt is not None,
                     "items": plugin.lt.stats()["items"] if plugin.lt else 0,
                 },
+                "selfcheck": selfcheck.run(plugin),
             }
         )
+
+    async def api_selfcheck(self) -> Any:
+        """自检清单（页面红条与 `/ctm doctor` 共用同一份判定）。"""
+        return json_response(selfcheck.run(self.plugin))
 
 
 ROUTES = (
@@ -195,6 +202,7 @@ ROUTES = (
     ("/{plugin}/topics", "api_topics", ("GET",), "Recent topics"),
     ("/{plugin}/memories", "api_memories", ("GET",), "Recent long-term memories"),
     ("/{plugin}/health", "api_health", ("GET",), "Health"),
+    ("/{plugin}/selfcheck", "api_selfcheck", ("GET",), "Self check"),
 )
 
 
