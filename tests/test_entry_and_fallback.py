@@ -86,6 +86,11 @@ class _FakeEvent:
         return self.stopped
 
 
+class _FakeResponse:
+    def __init__(self, text: str) -> None:
+        self.completion_text = text
+
+
 class _FakeRequest:
     def __init__(self) -> None:
         self.system_prompt = "你是助手。"
@@ -108,15 +113,17 @@ class _StubJudge:
 
 @unittest.skipUnless(HAS_ASTRBOT, "AstrBot runtime not installed")
 class EntryObservabilityTest(unittest.IsolatedAsyncioTestCase):
-    def _config(self, *, enabled=True, mode="hint", db_path=""):
+    def _config(self, *, enabled=True, mode="hint", db_path="", topic=None):
+        topic_cfg = {
+            "mode": mode,
+            "aggregation_enabled": False,
+            "judge_enabled": False,
+            "debug_mode": False,
+        }
+        topic_cfg.update(topic or {})
         return {
             "basic": {"enabled": enabled, "db_path": db_path},
-            "topic": {
-                "mode": mode,
-                "aggregation_enabled": False,
-                "judge_enabled": False,
-                "debug_mode": False,
-            },
+            "topic": topic_cfg,
             "longterm": {"enabled": False},
         }
 
@@ -259,6 +266,44 @@ class EntryObservabilityTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin.manual_new_topic(_FakeEvent(umo="s2"), "新话题")
         self.assertIsNotNone(self.plugin._pending_old_topic.get("s2"))
         self.assertNotIn("s2", self.plugin._turn_buffer, "硬切后轨迹应重置")
+
+    async def test_soft_switch_produces_topic_summary(self) -> None:
+        """诊断报告 4.1 / 五：软切后 topics.summary 与 memories(summary) 必须有内容。"""
+        import astrbot_plugin_ctm.main as plugin_main
+
+        umo = "s3:FriendMessage:u1"
+        plugin = plugin_main.CtmPlugin(
+            _FakeContext(),
+            self._config(
+                db_path=self.db_path,
+                topic={"min_turns_before_switch": 1, "judge_min_message_length": 2},
+            ),
+        )
+        self._plugins.append(plugin)
+        self.arm(plugin)
+        plugin.archiver.start()
+        try:
+            # 第 1 轮：建立话题，并把这一轮记进轨迹缓冲
+            first = _FakeEvent(text="表情包插件会跟对话中枢冲突吗", umo=umo)
+            await plugin.on_message(first)
+            await plugin.on_llm_response(
+                first,
+                _FakeResponse("两者都抢 priority 1000，把 main.py 第 51 行改成 900 即可共存"),
+            )
+            # 第 2 轮：显式换话题 → 软切，旧话题进归档
+            second = _FakeEvent(text="换个话题，聊聊周末去杭州的行程", umo=umo)
+            await plugin.on_message(second)
+            await plugin.on_llm_response(second, _FakeResponse("好，先定高铁票"))
+            await asyncio.sleep(0.6)
+
+            topics = plugin.store.recent_topics(20)
+            archived = [row for row in topics if row.get("summary")]
+            self.assertTrue(archived, "切分后旧话题必须有摘要")
+            self.assertIn("priority", archived[0]["summary"])
+            summaries = plugin.store.fetch_memories(umo, ("summary",), limit=10)
+            self.assertTrue(summaries, "摘要必须同时写成 memories(summary)")
+        finally:
+            await plugin.archiver.stop(2.0)
 
     async def test_llm_request_logged(self) -> None:
         self.arm(self.plugin)
