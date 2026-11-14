@@ -133,6 +133,16 @@ python tests/eval_topic_detection.py --db ~/.astrbot/data/data_v4.db
 接线测试（`test_import.py` / `test_entry_and_fallback.py`）在本机装了 AstrBot 时
 自动运行，否则条件跳过。
 
+## 兼容性
+
+| 项 | 说明 |
+| --- | --- |
+| AstrBot 版本 | `>= 4.26`。已在 4.26.5、4.28.1、4.29.1 上验证（handler 绑定/派发语义三版一致） |
+| 第三方依赖 | 无，纯标准库（SQLite 用内置） |
+| 页面 | 需要支持 `astrbot.api.web` 的版本；不支持时页面后端自动降级，`/ctm doctor` 仍可用 |
+| 同装冲突 | **不要**与 `astrbot_plugin_msg_aggregator` / `astrbot_plugin_topic_router_pro` 同装：三者都抢 `priority=1000`，会互相抢占事件、重复判定 |
+| 装完第一步 | 发 `/ctm doctor`，六项全 `ok` 才算真正生效（白名单是最容易漏的一项） |
+
 ## 排障
 
 插件"看起来正常但完全没反应"时，**先跑 `/ctm doctor`**（或看插件页顶部的
