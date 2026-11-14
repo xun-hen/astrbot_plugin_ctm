@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## v0.5.1
+
+### 修复：卸载（reload / 热更新）可能永久卡住
+
+真机部署 v0.5.0 时暴露：`terminate()` 里 `await archiver.stop()` / `await lt.close()`
+如果 worker 正卡在 provider 请求里，`await worker` 可能永不返回；而 AstrBot 的
+`reload` 是在持有插件管理锁的情况下等 `terminate()`，于是**所有**插件管理接口
+（reload / 禁用 / 更新）一起挂死，只能重启进程。
+
+- `terminate()` 一律限时：归档 6s、长期记忆 3s，超时只记 WARN 并继续；
+  同步清理（checkpoint/关连接）异常也只记日志 → 卸载一定能在 ~10s 内返回。
+- 拆出 `_await_bounded` / `_sync_bounded` / `_close_store`，便于单测与复用。
+- 排查手册补一条：装/换版本后如果 reload 一直转圈，是卸载被拖死，重启进程即可。
+
 ## v0.5.0
 
 ### 新增：自适应防抖（按用户调节合并窗口）

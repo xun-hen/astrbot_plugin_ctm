@@ -330,29 +330,49 @@ class CtmPlugin(Star):
         )
 
     async def terminate(self) -> None:
-        """插件卸载：flush 归档、checkpoint、关连接。"""
+        """插件卸载：flush 归档、checkpoint、关连接。
+
+        每一步都**限时**：卸载卡住会把 AstrBot 的插件管理锁一起占死，
+        之后所有 reload / 禁用 / 热更新都会一直超时（真机上踩过：
+        归档或长期记忆 worker 卡在 provider 请求里，`await worker` 永不返回）。
+        """
         self._started = False
         try:
             self.aggregation.close()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            await self.archiver.stop(5.0)
-        except Exception:  # noqa: BLE001
-            pass
+        await self._await_bounded("archiver.stop", self.archiver.stop(3.0), 6.0)
         if self.lt is not None:
-            try:
-                await self.lt.close()
-            except Exception:  # noqa: BLE001
-                pass
+            await self._await_bounded("longterm.close", self.lt.close(), 3.0)
         if self._lt_store is not None:
-            self._lt_store.close()
-        try:
-            self.store.checkpoint()
-            self.store.close()
-        except Exception:  # noqa: BLE001
-            pass
+            self._sync_bounded("lt_store.close", self._lt_store.close)
+        self._sync_bounded("store.close", self._close_store)
         logger.info(f"[{PLUGIN_NAME}] 已卸载。")
+
+    @staticmethod
+    async def _await_bounded(label: str, coro: Any, timeout: float) -> None:
+        """等待一个协程，超时即放弃（卸载绝不能被单步拖死）。"""
+        try:
+            await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"[{PLUGIN_NAME}] 卸载步骤 {label} 超时 {timeout}s，已放弃等待。")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[{PLUGIN_NAME}] 卸载步骤 {label} 失败：{exc}")
+
+    @staticmethod
+    def _sync_bounded(label: str, fn: Any) -> None:
+        """执行同步清理，异常只记日志。"""
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[{PLUGIN_NAME}] 卸载步骤 {label} 失败：{exc}")
+
+    def _close_store(self) -> None:
+        """checkpoint + 关闭 SQLite（幂等）。"""
+        self.store.checkpoint()
+        self.store.close()
 
     # ------------------------------------------------------------------ 消息入口
     async def on_message(self, event: AstrMessageEvent) -> None:
