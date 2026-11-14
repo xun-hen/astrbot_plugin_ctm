@@ -29,6 +29,7 @@ from astrbot.core.agent.message import TextPart
 
 from .config import PLUGIN_NAME, Config, load_config
 from .ctm import bindings, modes
+from .ctm.adaptive import AdaptiveConfig, AdaptiveDebounce
 from .ctm.aggregation import Aggregator
 from .ctm.archiver import ArchiveJob, Archiver
 from .ctm.cognition import Cognition, TurnDecision
@@ -47,6 +48,19 @@ from .ctm.topic_state import TopicStateMachine
 
 MESSAGE_PRIORITY = 1000
 DECISION_EXTRA = "ctm_decision"
+#: 归档摘要用的会话轮次窗口（太长的旧话题只保留最近这些轮，避免摘要 prompt 爆掉）
+TRANSCRIPT_MAX_TURNS = 24
+TRANSCRIPT_MAX_CHARS = 4000
+#: 话题摘要的固定要求：保留可复用的具体信息，而不是形容词。
+SUMMARY_SYSTEM_PROMPT = """你是对话归档员。把给定的对话片段压缩成一段日后能检索、能复用的摘要。
+
+要求：
+1. 四段结构，用中文小标题：在解决什么 / 已确认的结论与参数 / 未完成事项 / 踩过的坑；
+2. **优先保留具体信息**：文件名、配置项名、命令、数字、版本号、报错关键词；
+3. 200–400 字，不要客套话，不要编造片段里没有的内容；
+4. 某段没有内容就写「无」。
+
+只输出摘要正文，不要解释你在做什么。"""
 
 
 class CtmPlugin(Star):
@@ -78,7 +92,11 @@ class CtmPlugin(Star):
         self.cognition = Cognition(self.cfg, self.builder, self.topic_sm)
         self.commands = CtmCommands(self)
         self.archiver = Archiver(
-            self.store, self.memory, self.relationship, self.cfg
+            self.store,
+            self.memory,
+            self.relationship,
+            self.cfg,
+            summarizer=self._summarize_with_model,
         )
         self.lt: LongTermMemory | None = None
         self._lt_store: LongTermStore | None = None
@@ -93,11 +111,27 @@ class CtmPlugin(Star):
         self._handler_binding: dict[str, str] = {}
         self._plugin_set_state = "unknown"
         self._started_at = 0.0
+        self._turn_buffer: dict[str, deque[tuple[str, str]]] = {}
+        # 自适应防抖：按 (会话, 用户) 的发消息节奏调窗口；与聚合器共用同一时钟。
+        self.adaptive = AdaptiveDebounce(
+            AdaptiveConfig(
+                enabled=self.cfg.topic.aggregation_adaptive_enabled,
+                min_seconds=self.cfg.topic.aggregation_adaptive_min_seconds,
+                max_seconds=self.cfg.topic.aggregation_adaptive_max_seconds,
+                base_seconds=self.cfg.topic.aggregation_debounce_seconds,
+            ),
+            clock=time.monotonic,
+        )
         self.aggregation = Aggregator(
             enabled=self.cfg.topic.aggregation_enabled,
             debounce_seconds=self.cfg.topic.aggregation_debounce_seconds,
             max_wait_seconds=self.cfg.topic.aggregation_max_wait_seconds,
+            clock=time.monotonic,
             on_anomaly=self._agg_anomaly,
+            adaptive=self.adaptive
+            if self.cfg.topic.aggregation_enabled
+            and self.cfg.topic.aggregation_adaptive_enabled
+            else None,
         )
         self.topic_judge: TopicJudge | None = None
         if self.cfg.topic.judge_enabled:
@@ -438,13 +472,18 @@ class CtmPlugin(Star):
                 relationship,
                 forced_action=TopicAction.CONTINUE,
             )
+        # 软切与硬切都要归档旧话题：之前硬切把 old_topic_id 置空，导致
+        # `auto` 模式是细节丢失最严重的一条路（见诊断报告 3.2）。
+        archive_old_topic = None
+        if old_topic is not None and (
+            switched
+            or decision.topic_action
+            in (TopicAction.SOFT_BOUNDARY, TopicAction.HARD_SWITCH)
+        ):
+            archive_old_topic = old_topic.topic_id
         if modes.should_persist_state(self.cfg.topic.mode, debug):
             self._apply_topic_action(signal, state, decision, force_hard=False)
-            self._pending_old_topic[session_id] = (
-                old_topic.topic_id
-                if old_topic and decision.topic_action == TopicAction.SOFT_BOUNDARY
-                else None
-            )
+            self._pending_old_topic[session_id] = archive_old_topic
         else:
             self._pending_old_topic[session_id] = None
         self._pending_emotion[session_id] = signal.emotion_score
@@ -666,13 +705,15 @@ class CtmPlugin(Star):
         if self.cfg.topic.debug_mode:
             return
         response_text = getattr(response, "completion_text", "") or ""
+        user_text = event.message_str or ""
         self._last_assistant[session_id] = response_text[:500]
         decision = event.get_extra(DECISION_EXTRA)
         if isinstance(decision, TurnDecision):
+            # 摘要要用"切分点之前"的整段对话，所以先取轨迹、后记本轮。
             job = ArchiveJob(
                 turn_id=decision.turn_id,
                 session_id=session_id,
-                user_text=event.message_str or "",
+                user_text=user_text,
                 response_text=response_text,
                 topic_action=decision.topic_action.value,
                 persona_mode=decision.persona_mode.value,
@@ -685,6 +726,7 @@ class CtmPlugin(Star):
                 decision_json=json.dumps(decision.to_dict(), ensure_ascii=False),
                 injected_tokens=decision.estimated_tokens,
                 dropped_json=json.dumps(decision.dropped_items, ensure_ascii=False),
+                topic_transcript=self._transcript(session_id),
             )
             try:
                 if not await self.archiver.enqueue(job):
@@ -692,7 +734,52 @@ class CtmPlugin(Star):
             except Exception:  # noqa: BLE001
                 pass
             event.set_extra(DECISION_EXTRA, None)
+        self._remember_turn(session_id, user_text, response_text)
         self._observe_longterm(event, response_text)
+
+    # ------------------------------------------------------------------ 归档辅助
+    async def _summarize_with_model(self, prompt: str, session_id: str = "") -> str:
+        """用当前会话模型生成话题摘要；失败返回空串（由归档器回退到规则摘要）。"""
+        provider = await self._resolve_provider(
+            session_id, self.cfg.topic.judge_provider_id
+        )
+        if provider is None:
+            return ""
+        try:
+            response = await asyncio.wait_for(
+                provider.text_chat(
+                    system_prompt=SUMMARY_SYSTEM_PROMPT,
+                    contexts=[{"role": "user", "content": prompt}],
+                    request_max_retries=1,
+                ),
+                timeout=max(3.0, float(self.cfg.topic.judge_timeout_seconds) * 2),
+            )
+        except Exception as exc:  # noqa: BLE001 - 摘要失败不能影响归档其余阶段
+            log_event(LogCode.STORE_ERROR, session_id=session_id, error=f"summarize:{exc}")
+            return ""
+        return str(getattr(response, "completion_text", "") or "").strip()
+
+    def _remember_turn(self, session_id: str, user_text: str, assistant_text: str) -> None:
+        """把一轮对话放进滚动缓冲，供切分时生成整段摘要。"""
+        bucket = self._turn_buffer.get(session_id)
+        if bucket is None:
+            bucket = deque(maxlen=TRANSCRIPT_MAX_TURNS)
+            self._turn_buffer[session_id] = bucket
+        bucket.append((user_text or "", assistant_text or ""))
+
+    def _transcript(self, session_id: str) -> str:
+        """把当前缓冲拼成"用户/助手"交替的文本（不含本轮，调用方先取再记）。"""
+        bucket = self._turn_buffer.get(session_id)
+        if not bucket:
+            return ""
+        parts: list[str] = []
+        for user_text, assistant_text in bucket:
+            if user_text:
+                parts.append(f"用户：{user_text}")
+            if assistant_text:
+                parts.append(f"助手：{assistant_text}")
+        text = "\n".join(parts)
+        return text[-TRANSCRIPT_MAX_CHARS:]
 
     # ------------------------------------------------------------------ 状态落地
     def _ensure_initial_topic(self, signal: Any, state: Any) -> Any:
@@ -731,6 +818,7 @@ class CtmPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             log_event(LogCode.STORE_ERROR, session_id=signal.session_id, error=str(exc))
         try:
+            self._turn_buffer.pop(signal.session_id, None)
             self.topic_sm.hard_switch(signal, state)
             self._ensure_initial_topic(signal, state)
         except Exception as exc:  # noqa: BLE001
@@ -758,6 +846,11 @@ class CtmPlugin(Star):
                     event.unified_msg_origin, event.get_platform_id()
                 )
             state = self.topic_sm.load(signal.session_id)
+            previous = state.focus()
+            if previous is not None:
+                # 手动 /new 也要给旧话题留摘要（报告 3.2：否则细节全丢）
+                self._pending_old_topic[signal.session_id] = previous.topic_id
+            self._turn_buffer.pop(signal.session_id, None)
             self.topic_sm.hard_switch(signal, state)
             new_title = (title or "").strip() or "新话题"
             topic_id = self.store.create_topic(signal.session_id, new_title)
@@ -846,7 +939,7 @@ class CtmPlugin(Star):
                 sender_id=event.get_sender_id(),
                 group_id=str(event.get_group_id() or ""),
                 is_group=bool(event.get_group_id()),
-                user_text=event.message_str or "",
+                user_text=user_text,
                 assistant_text=response_text,
             )
         except Exception:  # noqa: BLE001

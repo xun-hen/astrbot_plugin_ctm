@@ -91,7 +91,11 @@ class PageApi:
                     "enabled": cfg.topic.aggregation_enabled,
                     "debounce_seconds": cfg.topic.aggregation_debounce_seconds,
                     "max_wait_seconds": cfg.topic.aggregation_max_wait_seconds,
+                    "adaptive": cfg.topic.aggregation_adaptive_enabled,
+                    "adaptive_min": cfg.topic.aggregation_adaptive_min_seconds,
+                    "adaptive_max": cfg.topic.aggregation_adaptive_max_seconds,
                     "active": plugin.aggregation.active_rounds(),
+                    "windows": plugin.aggregation.adaptive_stats(),
                 },
                 "budget": {
                     "injection_tokens": cfg.memory.injection_budget_tokens,

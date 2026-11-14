@@ -121,14 +121,20 @@ class MemoryStore:
         topic_id: int | None,
         summary: str,
         source_turn_id: str | None,
+        importance: float = 0.6,
     ) -> int:
-        """写入话题摘要（同一 topic 的旧摘要不删除，按时间倒序取最新）。"""
+        """写入话题摘要（同一 topic 的旧摘要不删除，按时间倒序取最新）。
+
+        Args:
+            importance: 重要度；摘要（整段对话的结论）默认高于普通记忆，
+                归档器传入 0.8 以提高后续召回权重。
+        """
         return int(
             self._store.insert_memory(
                 session_id=session_id,
                 memory_type=MemoryType.SUMMARY.value,
                 content=summary,
-                importance=0.6,
+                importance=max(0.0, min(1.0, float(importance))),
                 confidence=0.9,
                 source_turn_id=source_turn_id,
             )

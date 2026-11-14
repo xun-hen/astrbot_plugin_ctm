@@ -1,5 +1,57 @@
 # CHANGELOG
 
+## v0.5.0
+
+### 新增：自适应防抖（按用户调节合并窗口）
+
+固定 2 秒对两类人都不合适：爱连发的人经常"第二轮还没发完就回了"，习惯一句一条的人
+每次白等 2 秒。现在按 `(会话, 用户)` 学习发消息节奏：
+
+- `ctm/adaptive.py`：记录最近 12 条消息的时间戳，只统计**间隔 ≤ 15s** 的相邻消息
+  （更长的是"新一轮对话"，不算节奏），取中位数 × 1.35，夹在
+  `aggregation_adaptive_min_seconds..max_seconds`（默认 0.8–6s）。
+- 样本不足（<2 个间隔）→ 用基础值 `aggregation_debounce_seconds`（默认 2s，冷启动）；
+- 有足够历史但从未连发 → 直接取下限，回得更快；
+- 永不突破聚合总等待上限；`Aggregator` 每轮记录 `wait_seconds`，页面「聚合进行中」
+  新增"本轮窗口"列，`/overview` 的 `aggregation.windows` 暴露学习结果。
+- 字典上限 512 个 (会话, 用户)，超出淘汰最久没说话的，避免无限增长。
+- 配置：`topic.aggregation_adaptive_enabled` / `_min_seconds` / `_max_seconds`。
+
+### 修复：切分时没有真正保存细节（诊断报告 3.1–3.3）
+
+报告结论：`mode=hint` 下从未切分，而 `summarizer` 从未注入，归档摘要只有
+「话题标题 + 最后一句前 120 字」——切与不切都丢细节。本次三层一起修：
+
+1. **归档喂饱**：`main.py` 构造 `Archiver` 时注入 `summarizer`
+   （`_summarize_with_model`，走当前会话模型，超时/失败回退规则摘要）。
+   新增 `_turn_buffer`（每会话 24 轮、4000 字）与 `job.topic_transcript`：
+   摘要输入由"标题 + 最后一句"改为**切分点之前该话题的整段对话**。
+   摘要要求四段结构（在解决什么 / 已确认的结论与参数 / 未完成事项 / 踩过的坑），
+   200–400 字，优先保留文件名、配置项、命令、数字、报错关键词。
+2. **硬切也归档**：`SOFT_BOUNDARY`、`HARD_SWITCH`、`mode=auto` 新建对话、
+   `/ctm topic new` 都会把旧话题交给归档器（此前硬切把 `old_topic_id` 置空，
+   `auto` 反而成了细节丢失最严重的一条路）。
+3. **摘要可召回**：`memories(kind=summary)` 的 `importance` 由 0.6 提到 0.8；
+   `memory.assertion_confidence_threshold` 0.70 → 0.55，参数/结论类断言更容易入库。
+
+### 调整：判定阈值（诊断报告 4.2）
+
+- `topic.judge_min_message_length` 6 → **2**：3 字以上的中文短句不再一律按延续，
+  会进入相似度判断或交模型（受 `judge_max_checks_per_hour` 限流）。
+- `topic.min_turns_before_switch` 3 → **4**：避免"每句话都换一段"。
+- 其余建议（`mode=hint`、`strategy=soft`、`preserve_recent_topics=2`）本就是默认值，未改。
+
+### 测试
+
+- 新增 `tests/test_adaptive.py`（14 项）：关闭回退、冷启动、连发/单发、上下限夹取、
+  horizon 过滤、统计、聚合器接线。
+- 新增 `tests/test_archiver_summary.py`（7 项）：整段对话进 prompt、四段式回退、
+  模型失败回退、`summary` 记忆 importance ≥ 0.8、新默认值与 schema 一致。
+- `tests/test_entry_and_fallback.py` 增加：summarizer 必须被注入、轨迹缓冲、
+  `/ctm topic new` 标记旧话题并清空轨迹。
+- 全量 **88 tests OK**（无 AstrBot 环境时条件跳过）。
+
+
 ## v0.4.2
 
 ### 新增：自检（失效后**能看见**）

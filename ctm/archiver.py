@@ -45,6 +45,8 @@ class ArchiveJob:
     decision_json: str = ""
     injected_tokens: int = 0
     dropped_json: str = ""
+    #: 切分点之前该话题的整段对话（"用户：… / 助手：…"），供摘要使用。
+    topic_transcript: str = ""
 
 
 class Archiver:
@@ -153,26 +155,59 @@ class Archiver:
 
     # ------------------------------------------------------------------ stages
     async def _summarize_topic(self, job: ArchiveJob) -> str | None:
-        """为被软切的旧话题生成摘要并写回。"""
+        """为被切分（软切/硬切）的旧话题生成摘要并写回。
+
+        v0.5.0 之前只有软切会调用到这里，且只喂"标题 + 最后一句前 120 字"；
+        现在两个入口都会调用，输入改为切分点之前该话题的**整段对话**。
+        """
         if not job.old_topic_id:
             return None
-        topic = self._store.get_topic(int(job.old_topic_id))
+        topic_id = int(job.old_topic_id)
+        topic = self._store.get_topic(topic_id)
         if not topic:
             return None
-        text = f"{topic.get('title', '')}：{job.user_text[:120]}"
-        summary = text
-        if self._summarizer is not None:
+        title = str(topic.get("title") or "")
+        transcript = (job.topic_transcript or "").strip()
+        if not transcript:
+            transcript = f"用户：{job.user_text[:500]}" if job.user_text else ""
+        summary = self._fallback_summary(title, transcript)
+        if self._summarizer is not None and transcript:
+            prompt = build_summary_prompt(title, transcript)
             try:
-                generated = await self._summarizer([text])
-                if isinstance(generated, str) and generated.strip():
-                    summary = generated.strip()[:400]
+                generated = await self._summarizer(prompt, job.session_id)
+            except TypeError:
+                # 兼容只接受一个参数的旧回调
+                try:
+                    generated = await self._summarizer(prompt)
+                except Exception:  # noqa: BLE001
+                    generated = ""
             except Exception:  # noqa: BLE001
-                pass
-        self._store.update_topic(int(job.old_topic_id), summary=summary)
+                generated = ""
+            if isinstance(generated, str) and len(generated.strip()) >= 40:
+                summary = generated.strip()[:1200]
+        self._store.update_topic(topic_id, summary=summary)
         self._memory.save_summary(
-            job.session_id, int(job.old_topic_id), summary, job.turn_id
+            job.session_id, topic_id, summary, job.turn_id, importance=0.8
         )
         return summary
+
+    @staticmethod
+    def _fallback_summary(title: str, transcript: str) -> str:
+        """无模型/模型失败时的确定性摘要：保留可检索的具体信息。"""
+        lines = [line.strip() for line in transcript.splitlines() if line.strip()]
+        user_lines = [line for line in lines if line.startswith("用户：")]
+        assistant_lines = [line for line in lines if line.startswith("助手：")]
+        tail = " / ".join(line[2:].strip() for line in user_lines[-3:])[:300]
+        said = (assistant_lines[-1][3:].strip() if assistant_lines else "")[:200]
+        parts = [f"【{title or '未命名话题'}】"]
+        if user_lines:
+            parts.append(f"在解决什么：{tail or '未记录'}")
+        if said:
+            parts.append(f"已确认的结论与参数：{said}")
+        parts.append("未完成事项：无" if len(user_lines) < 2 else "未完成事项：详见上下文")
+        parts.append("踩过的坑：无")
+        parts.append(f"（共 {len(user_lines)} 轮对话）")
+        return "\n".join(parts)
 
     async def _extract_assertions(self, job: ArchiveJob) -> list[dict[str, Any]]:
         """规则抽取用户断言。"""
@@ -240,3 +275,13 @@ class Archiver:
             injected_tokens=job.injected_tokens,
             dropped_json=job.dropped_json or None,
         )
+
+def build_summary_prompt(title: str, transcript: str) -> str:
+    """把话题标题 + 整段对话拼成摘要 prompt（模块级，便于单测）。"""
+    header = f"话题标题：{title or '（未命名）'}\n"
+    body = (
+        "对话片段（按时间顺序，用户/助手交替）：\n"
+        + transcript
+        + "\n\n请按系统提示的四段结构输出摘要。"
+    )
+    return header + body

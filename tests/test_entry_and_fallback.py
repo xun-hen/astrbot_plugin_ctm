@@ -235,6 +235,31 @@ class EntryObservabilityTest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(no_decision and no_decision[0].get("reason", "").startswith("decide_error"))
 
+    async def test_summarizer_is_injected_into_archiver(self) -> None:
+        """报告 3.3：main.py 必须把 summarizer 传给 Archiver，否则摘要永远是标题+120 字。"""
+        self.assertIsNotNone(
+            getattr(self.plugin.archiver, "_summarizer", None),
+            "Archiver 必须拿到 summarizer（否则只会写规则回退摘要）",
+        )
+
+    async def test_transcript_buffer_collects_turns(self) -> None:
+        self.arm(self.plugin)
+        self.plugin._remember_turn("s1", "用户第一句", "助手第一句")
+        self.plugin._remember_turn("s1", "用户第二句", "助手第二句")
+        text = self.plugin._transcript("s1")
+        self.assertIn("用户：用户第一句", text)
+        self.assertIn("助手：助手第二句", text)
+        self.assertLessEqual(len(text), 4000)
+
+    async def test_manual_new_topic_marks_old_topic_for_archive(self) -> None:
+        self.arm(self.plugin)
+        event = _FakeEvent(umo="s2")
+        self.plugin._remember_turn("s2", "旧话题内容", "旧话题回复")
+        await self.plugin.on_message(_FakeEvent(text="先建一个话题", umo="s2"))
+        await self.plugin.manual_new_topic(_FakeEvent(umo="s2"), "新话题")
+        self.assertIsNotNone(self.plugin._pending_old_topic.get("s2"))
+        self.assertNotIn("s2", self.plugin._turn_buffer, "硬切后轨迹应重置")
+
     async def test_llm_request_logged(self) -> None:
         self.arm(self.plugin)
         await self.plugin.on_llm_request(_FakeEvent(), _FakeRequest())

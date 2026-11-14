@@ -210,7 +210,11 @@
         "description": "判定的执行方式",
         "type": "string",
         "default": "soft",
-        "options": ["off", "soft", "hard"],
+        "options": [
+          "off",
+          "soft",
+          "hard"
+        ],
         "hint": "off=只判定不动作；soft=压栈软边界（推荐）；hard=执行会话硬切换（等价 /new，旧上下文不再参与本轮）。",
         "obvious_hint": true
       },
@@ -223,8 +227,8 @@
       "min_turns_before_switch": {
         "description": "切换前最少轮数",
         "type": "int",
-        "default": 3,
-        "hint": "新话题至少持续这么多轮才允许切换，抑制「每句话都换话题」的抖动。"
+        "default": 4,
+        "hint": "新话题至少持续这么多轮才允许再切换，避免「每句话都换话题」的抖动。"
       },
       "switch_cooldown_seconds": {
         "description": "切换冷却（秒）",
@@ -241,7 +245,16 @@
       "sticky_keywords": {
         "description": "粘性关键词",
         "type": "list",
-        "default": ["承诺", "答应", "生日", "纪念日", "难过", "生病", "吵架", "对不起"],
+        "default": [
+          "承诺",
+          "答应",
+          "生日",
+          "纪念日",
+          "难过",
+          "生病",
+          "吵架",
+          "对不起"
+        ],
         "hint": "命中后禁止硬切，并降低软切灵敏度。精确匹配，区分大小写。"
       },
       "sticky_regex": {
@@ -253,7 +266,13 @@
       "new_intent_markers": {
         "description": "新意图标记词",
         "type": "list",
-        "default": ["另外", "话说", "换个话题", "对了", "突然想到"],
+        "default": [
+          "另外",
+          "话说",
+          "换个话题",
+          "对了",
+          "突然想到"
+        ],
         "hint": "出现这些词时，即使相似度没低到阈值也可能判为新话题（双信号中的第二个信号）。"
       },
       "aggregation_enabled": {
@@ -266,7 +285,12 @@
         "description": "运行模式",
         "type": "string",
         "default": "hint",
-        "options": ["off", "mark", "hint", "auto"],
+        "options": [
+          "off",
+          "mark",
+          "hint",
+          "auto"
+        ],
         "hint": "off=不判定；mark=只记录不注入；hint=判定并注入（推荐先观察）；auto=置信度达标时自动新建对话（等价 /new）。",
         "obvious_hint": true
       },
@@ -289,10 +313,10 @@
         "hint": "mode=auto 切换后回一句提示；默认静默。"
       },
       "aggregation_debounce_seconds": {
-        "description": "聚合防抖（秒）",
+        "description": "聚合防抖（秒，基础值）",
         "type": "float",
         "default": 2.0,
-        "hint": "最后一条消息之后等多久结算。"
+        "hint": "最后一条消息之后静默多久算这一轮结束。开启「自适应防抖」时，这是冷启动/兜底值：会按该用户最近的发消息节奏自动上下浮动。"
       },
       "aggregation_max_wait_seconds": {
         "description": "聚合总等待上限（秒）",
@@ -337,10 +361,10 @@
         "hint": "隔得久不凭时间硬切，而是请模型判断下一句是否延续。"
       },
       "judge_min_message_length": {
-        "description": "最短判定长度",
+        "description": "最短判定长度（字）",
         "type": "int",
-        "default": 6,
-        "hint": "短于此的消息（如“嗯”“继续”）按延续处理。"
+        "default": 2,
+        "hint": "短于该长度的消息（如「嗯」「好」）直接按延续处理，不问模型。中文短句信息密度高，默认 2：3 字以上都参与判定（受每小时上限约束）。"
       },
       "judge_short_message_length": {
         "description": "短句长度上限",
@@ -381,6 +405,24 @@
         "type": "bool",
         "default": true,
         "hint": "消息入口被更高优先级插件/内置会话控制拦截时，仍在 LLM 请求前判定并注入提示。"
+      },
+      "aggregation_adaptive_enabled": {
+        "description": "自适应防抖（按用户）",
+        "type": "bool",
+        "default": true,
+        "hint": "按该用户最近的发消息间隔自动调整防抖窗口：爱连发的人等久一点（少回几次），习惯一句一条的人等短一点（回复更快）。窗口只在该区间内浮动。"
+      },
+      "aggregation_adaptive_min_seconds": {
+        "description": "自适应窗口下限（秒）",
+        "type": "float",
+        "default": 0.8,
+        "hint": "自适应窗口不会低于它；也用于「习惯单发」的用户。"
+      },
+      "aggregation_adaptive_max_seconds": {
+        "description": "自适应窗口上限（秒）",
+        "type": "float",
+        "default": 6.0,
+        "hint": "自适应窗口不会高于它；仍未超过「聚合总等待上限」。"
       }
     }
   },
@@ -441,8 +483,8 @@
       "assertion_confidence_threshold": {
         "description": "断言置信度阈值",
         "type": "float",
-        "default": 0.7,
-        "hint": "低于该值的断言只写日志、不入库。"
+        "default": 0.55,
+        "hint": "低于该值的断言只写日志不入库。调低可让参数/结论类细节更容易转成记忆（默认 0.55）。"
       },
       "episode_salience_threshold": {
         "description": "情节显著性阈值",
@@ -494,7 +536,11 @@
         "description": "记忆后端",
         "type": "string",
         "default": "sqlite",
-        "options": ["sqlite", "living_memory", "memory_companion"],
+        "options": [
+          "sqlite",
+          "living_memory",
+          "memory_companion"
+        ],
         "hint": "living_memory / memory_companion 需要对应插件已安装并加载。"
       },
       "fallback_sqlite": {
@@ -556,7 +602,12 @@
         "description": "插件日志级别",
         "type": "string",
         "default": "INFO",
-        "options": ["DEBUG", "INFO", "WARNING", "ERROR"]
+        "options": [
+          "DEBUG",
+          "INFO",
+          "WARNING",
+          "ERROR"
+        ]
       },
       "log_redact": {
         "description": "日志脱敏",

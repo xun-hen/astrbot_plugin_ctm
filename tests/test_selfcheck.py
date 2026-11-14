@@ -76,6 +76,9 @@ class _Plugin:
                 aggregation_enabled=aggregation,
                 aggregation_debounce_seconds=2.0,
                 aggregation_max_wait_seconds=12.0,
+                aggregation_adaptive_enabled=True,
+                aggregation_adaptive_min_seconds=0.8,
+                aggregation_adaptive_max_seconds=6.0,
             )
         )
         self._started_at = time.time() - uptime

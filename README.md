@@ -1,6 +1,6 @@
 # 对话认知中枢（Cognitive Turn Manager）
 
-> **状态：v0.4.2（可运行）**。长期记忆（跨会话抽取 / 召回 / 管理）、话题软边界、
+> **状态：v0.5.0（可运行）**。长期记忆（跨会话抽取 / 召回 / 管理）、话题软边界、
 > 关系状态与异步归档已实现；`on_message → on_llm_request → on_llm_response`
 > 全链路可用，默认配置即可工作，核心零第三方依赖。
 
@@ -14,6 +14,8 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 | --- | --- |
 | 运行模式 | `off / mark / hint / auto`：只记录、只提示、或置信度达标时自动新建对话（等价 `/new`） |
 | 消息聚合 | 同一会话/同一发送者的连发消息先合并成一轮，再判定、只回一次 |
+| 自适应防抖 | 按用户最近的发消息节奏自动调合并窗口（0.8–6s）：爱连发的人少回几次，一句一条的人回得更快 |
+| 整段摘要 | 切分话题时把该话题的完整对话交给模型压成四段式摘要（在解决什么/结论与参数/未完成/踩过的坑），写入 `topics.summary` 与 `memories(summary)` |
 | 话题判定 | 启发式（相似度/承接词/换话题词/时间间隔）优先，拿不准时问一次便宜模型；失败一律按延续 |
 | 长期记忆 | 跨会话记住用户/群聊的稳定事实；回复后异步抽取，请求前按预算召回 |
 | 作用域隔离 | `user = platform:sender`、`group = platform:group`，群聊可同时读两者，成员之间互不串号 |
@@ -42,9 +44,15 @@ CTM 把「话题路由 + 长期记忆 + 人格/关系状态」收敛成一个决
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `topic.aggregation_enabled` | `true` | 连发消息合并（默认 2s 防抖，总等待上限 12s） |
+| `topic.aggregation_enabled` | `true` | 连发消息合并（总等待上限 12s） |
+| `topic.aggregation_adaptive_enabled` | `true` | 自适应防抖：按用户节奏在 `adaptive_min`–`adaptive_max` 间浮动 |
+| `topic.aggregation_adaptive_min_seconds` | `0.8` | 自适应窗口下限（习惯单发的用户走这里） |
+| `topic.aggregation_adaptive_max_seconds` | `6.0` | 自适应窗口上限 |
+| `topic.aggregation_debounce_seconds` | `2.0` | 基础/冷启动窗口：样本不足时用它 |
 | `topic.judge_enabled` | `true` | 话题判定；`judge_provider_id` 留空沿用当前模型 |
 | `topic.judge_max_checks_per_hour` | `30` | 每会话每小时模型判定上限 |
+| `topic.judge_min_message_length` | `2` | 短于此按延续处理；中文短句信息密度高，默认 2 |
+| `topic.min_turns_before_switch` | `4` | 新话题至少持续几轮才允许再切（防抖抖动） |
 | `topic.mode` | `hint` | 运行模式：`off` 不判定 / `mark` 只记录 / `hint` 判定并注入 / `auto` 自动新建对话 |
 | `topic.auto_threshold` | `0.8` | `auto` 模式切换对话所需置信度 |
 | `topic.debug_mode` | `false` | 空跑：判定照常但不注入、不切对话、不落状态 |
@@ -99,6 +107,7 @@ config.py               强类型配置（与 _conf_schema.json 对齐）
 pages/status/           插件详情页（只读运行状态，bridge + 5 个页面 API）
 ctm/
 ├── aggregation.py      连发消息防抖聚合（合并成一轮）
+├── adaptive.py         自适应防抖（按用户发消息节奏调窗口）
 ├── topic_judge.py      话题判定：启发式 + 可选 LLM 兜底
 ├── perception.py       规则感知（无 IO，P99 < 5ms）
 ├── textsim.py          词法相似度（Jaccard + 字符 2-gram）

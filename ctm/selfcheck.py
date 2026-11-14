@@ -211,10 +211,18 @@ def _check_aggregation(plugin: Any) -> dict[str, str]:
             "已关闭（每条消息各自成一轮）。",
         )
     anomalies = int(getattr(plugin.diag, "aggregation_anomalies", 0) or 0)
-    detail = (
-        f"防抖 {cfg.aggregation_debounce_seconds}s，总等待上限 "
-        f"{cfg.aggregation_max_wait_seconds}s"
-    )
+    if cfg.aggregation_adaptive_enabled:
+        detail = (
+            f"自适应窗口 {cfg.aggregation_adaptive_min_seconds}–"
+            f"{cfg.aggregation_adaptive_max_seconds}s（基础 "
+            f"{cfg.aggregation_debounce_seconds}s，按用户节奏浮动），总等待上限 "
+            f"{cfg.aggregation_max_wait_seconds}s"
+        )
+    else:
+        detail = (
+            f"固定防抖 {cfg.aggregation_debounce_seconds}s，总等待上限 "
+            f"{cfg.aggregation_max_wait_seconds}s"
+        )
     if anomalies:
         return _check(
             "aggregation",

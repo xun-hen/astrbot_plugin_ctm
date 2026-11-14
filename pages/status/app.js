@@ -127,7 +127,9 @@ function renderOverview(data) {
       : "关闭（仅启发式）"],
     ["请求钩子兜底", topic.detect_in_hook ? "开启" : "关闭"],
     ["消息聚合", agg.enabled
-      ? `开启；防抖 ${agg.debounce_seconds}s，总等待上限 ${agg.max_wait_seconds}s`
+      ? (agg.adaptive
+        ? `开启；自适应窗口 ${agg.adaptive_min}–${agg.adaptive_max}s（基础 ${agg.debounce_seconds}s），总等待上限 ${agg.max_wait_seconds}s`
+        : `开启；固定防抖 ${agg.debounce_seconds}s，总等待上限 ${agg.max_wait_seconds}s`)
       : "关闭"],
     ["注入预算", `${budget.injection_tokens} tokens（摘要 ${budget.summary_limit} / 断言 ${budget.assertion_limit} / 情节 ${budget.episode_limit}）`],
     ["Prompt 增幅上限", `${Math.round((budget.max_prompt_growth_ratio || 0) * 100)}%`],
@@ -202,7 +204,8 @@ function renderActive(rows) {
       cell(shortSession(row.session)),
       cell(row.sender || "–"),
       cell(int(row.items)),
-      cell(`${Number(row.age_seconds || 0).toFixed(1)}s`)
+      cell(`${Number(row.age_seconds || 0).toFixed(1)}s`),
+      cell(`${Number(row.window_seconds || 0).toFixed(1)}s`)
     );
     el.activeRows.appendChild(tr);
   }

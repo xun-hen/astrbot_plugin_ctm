@@ -52,7 +52,7 @@ class TopicConfig:
     auto_switch_enabled: bool = True
     auto_switch_strategy: str = STRATEGY_SOFT
     topic_threshold: float = 0.55
-    min_turns_before_switch: int = 3
+    min_turns_before_switch: int = 4
     switch_cooldown_seconds: int = 120
     preserve_recent_topics: int = 2
     sticky_keywords: tuple[str, ...] = (
@@ -76,6 +76,10 @@ class TopicConfig:
     aggregation_enabled: bool = True
     aggregation_debounce_seconds: float = 2.0
     aggregation_max_wait_seconds: float = 12.0
+    # 自适应防抖：按 (会话, 用户) 最近的发消息间隔调整防抖窗口（v0.5.0）
+    aggregation_adaptive_enabled: bool = True
+    aggregation_adaptive_min_seconds: float = 0.8
+    aggregation_adaptive_max_seconds: float = 6.0
     # 话题判定（启发式 + 可选 LLM 兜底）
     judge_enabled: bool = True
     judge_provider_id: str = ""
@@ -83,7 +87,7 @@ class TopicConfig:
     judge_sim_continue: float = 0.5
     judge_sim_new_topic: float = 0.12
     judge_time_gap_minutes: int = 45
-    judge_min_message_length: int = 6
+    judge_min_message_length: int = 2
     judge_short_message_length: int = 25
     judge_history_turns: int = 3
     judge_include_assistant_reply: bool = True
@@ -140,7 +144,7 @@ class MemoryConfig:
     episode_limit: int = 2
     recency_half_life_days: float = 14.0
     weights: Weights = field(default_factory=Weights)
-    assertion_confidence_threshold: float = 0.7
+    assertion_confidence_threshold: float = 0.55
     episode_salience_threshold: float = 0.6
 
 
@@ -429,6 +433,25 @@ def load_config(raw: dict[str, Any] | None) -> Config:
                 defaults.topic.aggregation_max_wait_seconds,
                 0.0,
                 120.0,
+            ),
+            aggregation_adaptive_enabled=_bool(
+                topic_raw,
+                "aggregation_adaptive_enabled",
+                defaults.topic.aggregation_adaptive_enabled,
+            ),
+            aggregation_adaptive_min_seconds=_float(
+                topic_raw,
+                "aggregation_adaptive_min_seconds",
+                defaults.topic.aggregation_adaptive_min_seconds,
+                0.1,
+                30.0,
+            ),
+            aggregation_adaptive_max_seconds=_float(
+                topic_raw,
+                "aggregation_adaptive_max_seconds",
+                defaults.topic.aggregation_adaptive_max_seconds,
+                0.1,
+                60.0,
             ),
             judge_enabled=_bool(
                 topic_raw, "judge_enabled", defaults.topic.judge_enabled

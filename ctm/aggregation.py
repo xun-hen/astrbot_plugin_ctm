@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .adaptive import AdaptiveDebounce
+
 DEFAULT_SEPARATOR = "\n"
 MAX_ROUNDS = 256
 #: owner 等待兜底的额外宽限；超时即放行，避免定时器异常时永久挂住消息。
@@ -34,6 +36,7 @@ class Round:
     extra_components: list[Any] = field(default_factory=list)
     created_at: float = 0.0
     last_at: float = 0.0
+    wait_seconds: float = 0.0
     flush: asyncio.Event = field(default_factory=asyncio.Event)
     timer: asyncio.Task[None] | None = None
     closed: bool = False
@@ -52,6 +55,7 @@ class Aggregator:
         clock: Callable[[], float] = time.monotonic,
         owner_grace_seconds: float = OWNER_GRACE_SECONDS,
         on_anomaly: Callable[[str, tuple[str, str]], None] | None = None,
+        adaptive: AdaptiveDebounce | None = None,
     ) -> None:
         """初始化。
 
@@ -65,6 +69,7 @@ class Aggregator:
                 `max_wait_seconds + owner_grace_seconds` 仍未 flush 就强制放行，
                 避免"owner 永久挂住、消息静默不回"。
             on_anomaly: 异常回调 `(原因, key)`，用于记日志/计数。
+            adaptive: 自适应防抖策略；None 表示固定窗口（按 `debounce_seconds`）。
         """
         self.enabled = enabled
         self.debounce_seconds = max(0.0, float(debounce_seconds))
@@ -73,6 +78,7 @@ class Aggregator:
         self.separator = separator
         self._clock = clock
         self._on_anomaly = on_anomaly
+        self._adaptive = adaptive
         self._rounds: dict[tuple[str, str], Round] = {}
         self._closed = False
 
@@ -104,6 +110,13 @@ class Aggregator:
 
         clean = (text or "").strip()
         now = self._clock()
+        if self._adaptive is not None:
+            self._adaptive.observe(key, now)
+        window = (
+            self._adaptive.window(key, base=self.debounce_seconds)
+            if self._adaptive is not None
+            else self.debounce_seconds
+        )
         rnd = self._rounds.get(key)
         if rnd is None or rnd.closed:
             if len(self._rounds) >= MAX_ROUNDS:
@@ -116,6 +129,7 @@ class Aggregator:
                 texts=[clean] if clean else [],
                 created_at=now,
                 last_at=now,
+                wait_seconds=window,
             )
             self._rounds[key] = rnd
             self._arm(rnd)
@@ -159,9 +173,16 @@ class Aggregator:
                     "sender": rnd.key[1],
                     "items": len(rnd.texts),
                     "age_seconds": round(max(0.0, now - rnd.created_at), 1),
+                    "window_seconds": round(float(rnd.wait_seconds or 0.0), 2),
                 }
             )
         return rows
+
+    def adaptive_stats(self) -> list[dict[str, Any]]:
+        """导出自适应窗口的学习结果（空列表 = 未启用）。"""
+        if self._adaptive is None:
+            return []
+        return self._adaptive.stats()
 
     def close(self) -> None:
         """插件卸载：结算所有进行中的轮次并停止计时器。"""
@@ -196,7 +217,8 @@ class Aggregator:
             rnd.timer.cancel()
         now = self._clock()
         remaining = self.max_wait_seconds - (now - rnd.created_at)
-        wait = max(0.0, min(self.debounce_seconds, remaining))
+        window = float(rnd.wait_seconds or self.debounce_seconds)
+        wait = max(0.0, min(window, remaining))
         rnd.timer = asyncio.create_task(self._wait(rnd, wait))
 
     async def _wait(self, rnd: Round, seconds: float) -> None:
