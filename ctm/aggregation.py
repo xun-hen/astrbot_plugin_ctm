@@ -20,6 +20,8 @@ from typing import Any, Callable
 
 DEFAULT_SEPARATOR = "\n"
 MAX_ROUNDS = 256
+#: owner 等待兜底的额外宽限；超时即放行，避免定时器异常时永久挂住消息。
+OWNER_GRACE_SECONDS = 5.0
 
 
 @dataclass
@@ -48,6 +50,8 @@ class Aggregator:
         max_wait_seconds: float = 12.0,
         separator: str = DEFAULT_SEPARATOR,
         clock: Callable[[], float] = time.monotonic,
+        owner_grace_seconds: float = OWNER_GRACE_SECONDS,
+        on_anomaly: Callable[[str, tuple[str, str]], None] | None = None,
     ) -> None:
         """初始化。
 
@@ -57,12 +61,18 @@ class Aggregator:
             max_wait_seconds: 从第一条消息算起的总等待上限。
             separator: 合并文本的分隔符。
             clock: 单调时钟，测试可注入。
+            owner_grace_seconds: owner 等待 flush 的额外宽限；超过
+                `max_wait_seconds + owner_grace_seconds` 仍未 flush 就强制放行，
+                避免"owner 永久挂住、消息静默不回"。
+            on_anomaly: 异常回调 `(原因, key)`，用于记日志/计数。
         """
         self.enabled = enabled
         self.debounce_seconds = max(0.0, float(debounce_seconds))
         self.max_wait_seconds = max(self.debounce_seconds, float(max_wait_seconds))
+        self.owner_grace_seconds = max(0.0, float(owner_grace_seconds))
         self.separator = separator
         self._clock = clock
+        self._on_anomaly = on_anomaly
         self._rounds: dict[tuple[str, str], Round] = {}
         self._closed = False
 
@@ -98,6 +108,7 @@ class Aggregator:
         if rnd is None or rnd.closed:
             if len(self._rounds) >= MAX_ROUNDS:
                 # 极端情况下不让字典无限增长：结算最老的一轮。
+                self._notify("rounds_overflow", key)
                 self._flush_oldest()
             rnd = Round(
                 key=key,
@@ -117,7 +128,14 @@ class Aggregator:
 
         if rnd.owner_event is event:
             try:
-                await rnd.flush.wait()
+                # 兜底：定时器被取消/事件循环异常时 flush 可能永不被 set，
+                # owner 会永久挂在这里 = 用户消息静默不回。超时强制放行。
+                await asyncio.wait_for(
+                    rnd.flush.wait(),
+                    timeout=self.max_wait_seconds + self.owner_grace_seconds,
+                )
+            except asyncio.TimeoutError:
+                self._notify("owner_wait_timeout", key)
             except asyncio.CancelledError:
                 self._abort(key, rnd)
                 raise
@@ -155,6 +173,15 @@ class Aggregator:
                 rnd.timer.cancel()
 
     # ------------------------------------------------------------------ internal
+    def _notify(self, reason: str, key: tuple[str, str]) -> None:
+        """把异常交给外部回调（不回抛，不影响消息流）。"""
+        if self._on_anomaly is None:
+            return
+        try:
+            self._on_anomaly(reason, key)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _append_extra_components(self, rnd: Round, event: Any) -> None:
         message_obj = getattr(event, "message_obj", None)
         components = getattr(message_obj, "message", None)

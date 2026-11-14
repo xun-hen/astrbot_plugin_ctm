@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .bindings import describe as describe_binding
 from .injection import InjectionBuilder
 from .observability import LogCode, log_event
 
@@ -81,6 +82,8 @@ class CtmCommands:
             f"亲密度：{relationship.intimacy:.2f}  张力：{relationship.tension:.2f}",
             f"预算：{plugin.cfg.memory.injection_budget_tokens} tokens",
             f"当前注入：{diag['injected_tokens']} tokens / 丢弃 {diag['dropped_items']} 条",
+            f"入口：entries={diag['entries']} decisions={diag['decisions']} "
+            f"skips={diag['skips']}",
             f"长期记忆：{plugin.lt.stats()['items']} 条" if plugin.lt else "长期记忆：未启用",
             f"诊断：{json.dumps(diag, ensure_ascii=False)}",
         ]
@@ -264,15 +267,26 @@ class CtmCommands:
         )
 
     async def health(self, event: Any, args: list[str]) -> str:
-        """`/ctm health`：DB / 队列健康。"""
+        """`/ctm health`：DB / 队列 / handler 绑定 / 入口计数。"""
         plugin = self._plugin
         store_health = plugin.store.health()
+        diag = plugin.diag.as_dict()
+        binding = getattr(plugin, "_handler_binding", None) or {}
         lines = [
             f"store: {'ok' if store_health.get('ok') else 'error'} "
             f"{store_health.get('path', '')}",
             f"archive queue: {plugin.archiver._queue.qsize()}",  # noqa: SLF001
             f"longterm: {'ok' if plugin.lt is not None else 'off'}",
+            f"handlers: {describe_binding(binding)}",
+            f"入口: entries={diag['entries']} decisions={diag['decisions']} "
+            f"skips={diag['skips']} no_decision={diag['no_decision']} "
+            f"llm_requests={diag['llm_requests']}",
         ]
+        if diag["entries"] == 0 and diag["llm_requests"] > 0:
+            lines.append(
+                "⚠ 只有请求钩子被调用、消息入口从未进入：典型原因是同优先级的"
+                "其他插件 stop_event() 抢占了事件，或本插件会话级被禁用。"
+            )
         return "\n".join(lines)
 
 

@@ -1,6 +1,14 @@
 """AstrBot 接线层：消息入口 → 联合决策 → 单次注入 → 异步归档。
 
-模块级 handler 通过模块级单例转发到插件实例，逻辑保留在实例方法里，便于单测。
+**接线约定（v0.4.1 起，硬约束）**：所有 `@filter.*` handler 必须是
+`CtmPlugin` 的**类方法**（第一参数 `self`）。AstrBot 装载插件时会把插件实例
+`functools.partial` 绑到 handler 的第一个位置参数上
+（`astrbot/core/star/star_manager.py`，4.26/4.28/4.29 一致）；模块级
+`async def f(event)` 会被派发成 `f(实例, event)` → `TypeError`，而该异常被
+`context_utils.call_handler` 吞掉只留一行框架 ERROR 日志，然后照常走 LLM。
+外部表现：加载成功、启动日志正常、配置生效，但一条消息都不处理、库 0 行、
+插件日志 0 行（v0.4.0 的现场）。启动自检见 `ctm/bindings.py`。
+
 所有 hook 都吞掉异常（CancelledError 除外），插件出错不能变成"用户消息没人回"。
 """
 
@@ -20,13 +28,13 @@ from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
 
 from .config import PLUGIN_NAME, Config, load_config
+from .ctm import bindings, modes
 from .ctm.aggregation import Aggregator
 from .ctm.archiver import ArchiveJob, Archiver
 from .ctm.cognition import Cognition, TurnDecision
 from .ctm.commands import CtmCommands
 from .ctm.enums import TopicAction
 from .ctm.injection import InjectionBuilder
-from .ctm import modes
 from .ctm.longterm.manager import LongTermMemory
 from .ctm.longterm.store import LongTermStore
 from .ctm.memory_store import MemoryStore
@@ -40,75 +48,6 @@ from .ctm.topic_state import TopicStateMachine
 MESSAGE_PRIORITY = 1000
 DECISION_EXTRA = "ctm_decision"
 
-_INSTANCE: "CtmPlugin | None" = None
-
-
-def _get_instance() -> "CtmPlugin | None":
-    """返回模块级单例；尚未构造时返回 None。"""
-    return _INSTANCE
-
-
-@filter.event_message_type(filter.EventMessageType.ALL, priority=MESSAGE_PRIORITY)
-async def ctm_on_event(event: AstrMessageEvent) -> None:
-    """消息入口：感知、决策、挂决策；不阻断事件。"""
-    plugin = _get_instance()
-    if plugin is None:
-        return
-    try:
-        await plugin.on_message(event)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.exception(f"[{PLUGIN_NAME}] 消息入口异常（已兜住）：{exc}")
-
-
-@filter.on_llm_request()
-async def ctm_on_llm_request(event: AstrMessageEvent, req: ProviderRequest) -> None:
-    """LLM 请求前：唯一注入点。"""
-    plugin = _get_instance()
-    if plugin is None:
-        return
-    try:
-        await plugin.on_llm_request(event, req)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.exception(f"[{PLUGIN_NAME}] 注入阶段异常（已兜住）：{exc}")
-
-
-@filter.on_llm_response()
-async def ctm_on_llm_response(event: AstrMessageEvent, response: LLMResponse) -> None:
-    """LLM 响应后：投递归档任务。"""
-    plugin = _get_instance()
-    if plugin is None:
-        return
-    try:
-        await plugin.on_llm_response(event, response)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.exception(f"[{PLUGIN_NAME}] 归档投递异常（已兜住）：{exc}")
-
-
-@filter.command("ctm")
-async def ctm_command(event: AstrMessageEvent):
-    """`/ctm` 管理命令入口。"""
-    plugin = _get_instance()
-    if plugin is None:
-        return
-    async for result in plugin.on_command(event):
-        yield result
-
-
-@filter.command("topicweave", alias={"话题织机"})
-async def ctw_command(event: AstrMessageEvent):
-    """`/topicweave` 别名入口（与 `/ctm` 等价）。"""
-    plugin = _get_instance()
-    if plugin is None:
-        return
-    async for result in plugin.on_command(event):
-        yield result
-
 
 class CtmPlugin(Star):
     """对话认知中枢插件主体。"""
@@ -121,13 +60,14 @@ class CtmPlugin(Star):
             config: 插件配置（通常是 `AstrBotConfig`，dict 子类）。
         """
         super().__init__(context)
-        global _INSTANCE
-        _INSTANCE = self
-
         self.cfg: Config = load_config(config)
         self.diag = Diag()
         self.data_dir = Path(self._data_dir())
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+        # 先绑好日志出口：即使 initialize() 提前返回（配置未启用等），
+        # 入口日志也一定能打出来——"零日志"本身不能成为故障的一部分。
+        configure(self._emit_log)
 
         self.store = Store(self._resolve_db_path())
         self.perception = Perception(self.cfg.topic)
@@ -149,10 +89,13 @@ class CtmPlugin(Star):
         self._recent: dict[str, deque[str]] = {}
         self._last_assistant: dict[str, str] = {}
         self._topic_disabled: set[str] = set()
+        self._fallback_reason = "not_tried"
+        self._handler_binding: dict[str, str] = {}
         self.aggregation = Aggregator(
             enabled=self.cfg.topic.aggregation_enabled,
             debounce_seconds=self.cfg.topic.aggregation_debounce_seconds,
             max_wait_seconds=self.cfg.topic.aggregation_max_wait_seconds,
+            on_anomaly=self._agg_anomaly,
         )
         self.topic_judge: TopicJudge | None = None
         if self.cfg.topic.judge_enabled:
@@ -173,13 +116,107 @@ class CtmPlugin(Star):
             )
         logger.info(f"[{PLUGIN_NAME}] 实例已构造 | 数据目录={self.data_dir}")
 
+    # ------------------------------------------------------------------ handler 接线
+    # 必须是类方法（见模块 docstring）：框架会把实例 partial 到第一参数上。
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=MESSAGE_PRIORITY)
+    async def ctm_on_event(self, event: AstrMessageEvent) -> None:
+        """消息入口：感知、决策、挂决策；不阻断事件。"""
+        try:
+            await self.on_message(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"[{PLUGIN_NAME}] 消息入口异常（已兜住）：{exc}")
+
+    @filter.on_llm_request()
+    async def ctm_on_llm_request(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """LLM 请求前：唯一注入点。"""
+        try:
+            await self.on_llm_request(event, req)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"[{PLUGIN_NAME}] 注入阶段异常（已兜住）：{exc}")
+
+    @filter.on_llm_response()
+    async def ctm_on_llm_response(
+        self, event: AstrMessageEvent, response: LLMResponse
+    ) -> None:
+        """LLM 响应后：投递归档任务。"""
+        try:
+            await self.on_llm_response(event, response)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"[{PLUGIN_NAME}] 归档投递异常（已兜住）：{exc}")
+
+    @filter.command("ctm")
+    async def ctm_command(self, event: AstrMessageEvent):
+        """`/ctm` 管理命令入口。"""
+        async for result in self.on_command(event):
+            yield result
+
+    @filter.command("topicweave", alias={"话题织机"})
+    async def ctw_command(self, event: AstrMessageEvent):
+        """`/topicweave` 别名入口（与 `/ctm` 等价）。"""
+        async for result in self.on_command(event):
+            yield result
+
+    def _verify_handler_binding(self) -> dict[str, str]:
+        """启动自检：handler 是否都已注册并被框架绑定到本实例。
+
+        这一类故障（见模块 docstring）在运行期完全静默，只能在启动时核对。
+        自检失败只记 WARN，不阻断插件。
+
+        Returns:
+            `{handler 名: ok|missing|unbound|unknown}`。
+        """
+        try:
+            from astrbot.core.star.star_handler import star_handlers_registry
+        except Exception:  # noqa: BLE001 - 老版本/无框架时跳过
+            return dict.fromkeys(bindings.HANDLER_NAMES, bindings.STATUS_UNKNOWN)
+        result = bindings.audit_handlers(
+            star_handlers_registry,
+            type(self).__module__,
+            bindings.HANDLER_NAMES,
+        )
+        bad = {
+            name: status
+            for name, status in result.items()
+            if status != bindings.STATUS_OK
+        }
+        if bad:
+            log_event(
+                LogCode.HANDLER_BINDING,
+                error=",".join(f"{name}={status}" for name, status in bad.items()),
+            )
+            logger.warning(
+                f"[{PLUGIN_NAME}] handler 绑定自检异常：{bad}。"
+                "handler 必须是本插件的类方法（第一参数 self），"
+                "否则 AstrBot 派发时会 TypeError 且被框架吞掉（表现为零日志、零数据）。"
+            )
+        else:
+            logger.info(
+                f"[{PLUGIN_NAME}] handler 绑定自检通过："
+                f"{len(result)} 个 handler 均已绑定本实例。"
+            )
+        return result
+
+
     # ------------------------------------------------------------------ 生命周期
     async def initialize(self) -> None:
-        """插件加载：建库、起归档 worker、起长期记忆 worker。"""
-        if not self.cfg.enabled:
-            logger.info(f"[{PLUGIN_NAME}] 配置未启用，插件不工作。")
-            return
+        """插件加载：自检 handler 绑定、建库、起归档 worker、起长期记忆 worker。"""
         configure(self._emit_log)
+        self._handler_binding = self._verify_handler_binding()
+        if not self.cfg.enabled:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 配置 basic.enabled=false，插件不工作"
+                "（面板 → 插件配置 → 启用认知中枢）。这条 WARN 是故意留的："
+                "关掉总开关时不能只剩静默。"
+            )
+            return
         try:
             self.store.init()
         except Exception as exc:  # noqa: BLE001
@@ -216,7 +253,6 @@ class CtmPlugin(Star):
 
     async def terminate(self) -> None:
         """插件卸载：flush 归档、checkpoint、关连接。"""
-        global _INSTANCE
         self._started = False
         try:
             self.aggregation.close()
@@ -238,19 +274,39 @@ class CtmPlugin(Star):
             self.store.close()
         except Exception:  # noqa: BLE001
             pass
-        _INSTANCE = None
         logger.info(f"[{PLUGIN_NAME}] 已卸载。")
 
     # ------------------------------------------------------------------ 消息入口
     async def on_message(self, event: AstrMessageEvent) -> None:
-        """处理一条消息：感知 → 召回 → 决策 → 挂到事件上。"""
+        """处理一条消息：感知 → 召回 → 决策 → 挂到事件上。
+
+        入口先打一条 `INFO_ENTRY`（含会话、文本长度、模式），每个静默返回点再打
+        `DEBUG_SKIP`（带 reason）。这样"消息进来没 / 卡在哪一步"永远可查——
+        v0.4.0 的故障就是因为四个返回点都不留痕、只能靠查库才发现。
+        """
+        session_key = str(getattr(event, "unified_msg_origin", "") or "")
+        self.diag.entries += 1
+        log_event(
+            LogCode.ENTRY,
+            session_id=session_key,
+            text_len=len(str(getattr(event, "message_str", "") or "")),
+            mode=self.cfg.topic.mode,
+            enabled=self.cfg.enabled,
+            aggregate=self.cfg.topic.aggregation_enabled,
+        )
         if not self.cfg.enabled:
+            self._skip("disabled", session_id=session_key)
             return
-        session_key = event.unified_msg_origin
         if self.cfg.topic.mode == "off" or session_key in self._topic_disabled:
+            self._skip(
+                "mode_off" if self.cfg.topic.mode == "off" else "session_off",
+                session_id=session_key,
+                mode=self.cfg.topic.mode,
+            )
             return
         signal = self.perception.extract(event)
         if signal.is_command:
+            self._skip("command", session_id=signal.session_id)
             await self.aggregation.accept(
                 event,
                 key=(signal.session_id, signal.user_id),
@@ -259,6 +315,15 @@ class CtmPlugin(Star):
             )
             return
         if not signal.text:
+            self._skip(
+                "empty_text",
+                session_id=signal.session_id,
+                has_message_str=hasattr(event, "message_str"),
+                message_str_type=type(
+                    getattr(event, "message_str", None)
+                ).__name__,
+                has_message_obj=hasattr(event, "message_obj"),
+            )
             return
         if self.cfg.topic.aggregation_enabled:
             proceed = await self.aggregation.accept(
@@ -267,10 +332,15 @@ class CtmPlugin(Star):
                 text=signal.text,
             )
             if not proceed:
+                self._skip(
+                    "aggregating_follower",
+                    session_id=signal.session_id,
+                )
                 return
             # owner 恢复后事件正文已合并，重新感知一次。
             signal = self.perception.extract(event)
             if not signal.text:
+                self._skip("empty_after_aggregate", session_id=signal.session_id)
                 return
         session_id = signal.session_id
         recent = self._recent.setdefault(
@@ -358,42 +428,82 @@ class CtmPlugin(Star):
     ) -> None:
         """唯一注入点：常驻注入 CTM 决策块 + 长期记忆块。"""
         if not self.cfg.enabled:
+            self._skip("llm_request_disabled", session_id=str(getattr(
+                event, "unified_msg_origin", "") or ""))
             return
         session_id = event.unified_msg_origin
+        self.diag.llm_requests += 1
+        log_event(
+            LogCode.LLM_REQUEST,
+            session_id=session_id,
+            mode=self.cfg.topic.mode,
+            prompt_len=len(str(getattr(req, "prompt", "") or "")),
+            has_decision=isinstance(event.get_extra(DECISION_EXTRA), TurnDecision),
+        )
         await self._inject_longterm(event, req)
         if not modes.should_inject(
             self.cfg.topic.mode, self.cfg.topic.debug_mode
         ) or session_id in self._topic_disabled:
+            self._skip(
+                "inject_off",
+                session_id=session_id,
+                mode=self.cfg.topic.mode,
+                debug=self.cfg.topic.debug_mode,
+            )
             return
         decision = event.get_extra(DECISION_EXTRA)
         if not isinstance(decision, TurnDecision):
             decision = await self._fallback_decision(event)
         if decision is None:
-            if self.diag.decisions:
-                self.diag.no_decision += 1
-                log_event(LogCode.NO_DECISION, session_id=session_id)
+            # 曾经这里有个 `if self.diag.decisions:` 门禁——计数为 0 恰恰是
+            # 最需要留痕的时刻（"入口被抢占"整类故障因此完全静默）。
+            self.diag.no_decision += 1
+            log_event(
+                LogCode.NO_DECISION,
+                session_id=session_id,
+                reason=self._fallback_reason,
+            )
             return
         self._inject_decision(req, decision, session_id)
 
     async def _fallback_decision(
         self, event: AstrMessageEvent
     ) -> TurnDecision | None:
-        """消息入口被抢占时的兜底判定（只注入，不改话题状态）。"""
-        if not self.cfg.topic.detect_in_hook_enabled or self.topic_judge is None:
+        """消息入口被抢占时的兜底判定（只注入，不改话题状态）。
+
+        与 v0.4.0 的差别：**没有话题栈也要兜底**。栈只由 `on_message` 建立，
+        而兜底本来就是给"on_message 没跑到"准备的；旧逻辑 `if not state.stack:
+        return None` 会形成死锁——入口被抢占 → 栈永远为空 → 兜底永远放弃。
+
+        返回 None 时把原因写进 `self._fallback_reason`，由调用方记日志。
+        """
+        self._fallback_reason = "unknown"
+        if not self.cfg.topic.detect_in_hook_enabled:
+            self._fallback_reason = "fallback_disabled"
+            return None
+        if self.topic_judge is None:
+            self._fallback_reason = "judge_disabled"
             return None
         if not modes.should_inject(
             self.cfg.topic.mode, self.cfg.topic.debug_mode
         ):
+            self._fallback_reason = "inject_off"
             return None
         if event.unified_msg_origin in self._topic_disabled:
+            self._fallback_reason = "session_off"
             return None
         signal = self.perception.extract(event)
-        if not signal.text or signal.is_command:
+        if not signal.text:
+            self._fallback_reason = "empty_text"
+            return None
+        if signal.is_command:
+            self._fallback_reason = "command"
             return None
         session_id = signal.session_id
         state = self.topic_sm.load(session_id)
         if not state.stack:
-            return None
+            state = self._ephemeral_state(signal, state)
+            self._fallback_reason = "empty_stack_recovered"
         relationship = self.relationship.load(session_id)
         recent_items = list(self._recent.get(session_id, ()))
         recent = recent_items[-max(1, self.cfg.topic.judge_history_turns) :]
@@ -408,15 +518,46 @@ class CtmPlugin(Star):
             decision = self.cognition.decide(
                 signal, state, [], relationship, verdict=verdict
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._fallback_reason = f"decide_error:{exc}"
             return None
-        self.diag.no_decision += 1
+        if self._fallback_reason == "unknown":
+            self._fallback_reason = "ok"
         log_event(
             LogCode.PREEMPTED,
             session_id=session_id,
             action=decision.topic_action.value,
+            reason=self._fallback_reason,
         )
         return decision
+
+    def _ephemeral_state(self, signal: Any, state: Any) -> Any:
+        """构造只存在于内存的话题状态（不写库），供空栈兜底判定使用。"""
+        from .ctm.topic_state import TopicNode, TopicState
+
+        now = time.time()
+        try:
+            title = self.topic_sm.title_for(getattr(signal, "text", ""))
+        except Exception:  # noqa: BLE001
+            title = ""
+        title = (title or "").strip() or "（临时话题）"
+        node = TopicNode(
+            topic_id=-1,
+            title=title,
+            created_at=now,
+            last_active_at=now,
+        )
+        return TopicState(
+            session_id=str(getattr(state, "session_id", "") or ""),
+            stack=[node],
+            current_topic=title,
+            previous_topic=getattr(state, "previous_topic", None),
+            turns_since_switch=int(getattr(state, "turns_since_switch", 0) or 0),
+            last_switch_at=float(getattr(state, "last_switch_at", 0.0) or 0.0),
+            soft_boundary_pending=bool(
+                getattr(state, "soft_boundary_pending", False)
+            ),
+        )
 
     def _inject_decision(
         self,
@@ -804,5 +945,27 @@ class CtmPlugin(Star):
             logger.error(message)
         elif level == "WARNING":
             logger.warning(message)
+        elif level == "DEBUG":
+            logger.debug(message)
         else:
             logger.info(message)
+
+    def _skip(self, reason: str, *, session_id: str = "-", **fields: Any) -> None:
+        r"""记录一次"静默返回"。
+
+        级别是 DEBUG（不刷屏），但**一定留痕**：用
+        `grep -F '[astrbot_plugin_ctm]' | grep DEBUG_SKIP`（面板日志把级别调到
+        DEBUG）就能看到每条消息卡在哪一步。
+
+        Args:
+            reason: 稳定的原因码（`disabled` / `mode_off` / `empty_text` / ...）。
+            session_id: 会话标识。
+            fields: 附加诊断字段。
+        """
+        self.diag.skips += 1
+        log_event(LogCode.SKIP, session_id=session_id, reason=reason, **fields)
+
+    def _agg_anomaly(self, reason: str, key: tuple[str, str]) -> None:
+        """聚合器异常（owner 等待超时、轮次溢出）→ 计数并记 WARN。"""
+        self.diag.aggregation_anomalies += 1
+        log_event(LogCode.AGGREGATION, session_id=key[0] if key else "-", reason=reason)

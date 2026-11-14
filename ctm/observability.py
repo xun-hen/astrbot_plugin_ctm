@@ -11,12 +11,21 @@ LOG_PREFIX = "[ctm]"
 
 
 class LogCode(str, Enum):
-    """稳定日志码。新增错误路径必须先在这里加码。"""
+    """稳定日志码。新增错误路径必须先在这里加码。
 
+    前缀决定级别：`INFO_` / `DEBUG_` / `WARN_` / `ERROR_`。静默分支一律用
+    `DEBUG_SKIP`，保证「消息进来了但没有决策」这件事永远可查、又不刷屏。
+    """
+
+    ENTRY = "INFO_ENTRY"
     DECISION = "INFO_DECISION"
     DROPPED = "INFO_DROPPED"
+    LLM_REQUEST = "DEBUG_LLM_REQUEST"
+    SKIP = "DEBUG_SKIP"
     NO_DECISION = "WARN_NO_DECISION"
     PREEMPTED = "WARN_PREEMPTED"
+    AGGREGATION = "WARN_AGGREGATION"
+    HANDLER_BINDING = "WARN_HANDLER_BINDING"
     INJECTION_ERROR = "ERROR_INJECTION"
     BUDGET_OVERFLOW = "WARN_BUDGET_OVERFLOW"
     DUPLICATE_INJECTION = "WARN_DUPLICATE_INJECTION"
@@ -56,10 +65,12 @@ def log_event(
     if emitter is None:
         return
     level = "INFO"
-    if code.value.startswith("WARN"):
-        level = "WARNING"
-    elif code.value.startswith("ERROR"):
+    if code.value.startswith("ERROR"):
         level = "ERROR"
+    elif code.value.startswith("WARN"):
+        level = "WARNING"
+    elif code.value.startswith("DEBUG"):
+        level = "DEBUG"
     payload = {
         "code": code.value,
         "session_id": session_id,
@@ -86,6 +97,11 @@ class Diag:
     injection_errors: int = 0
     archive_failures: int = 0
     adapter_fallbacks: int = 0
+    # 入口可观测性：`entries` 与 `decisions` 的差值就是"进来了但没产出决策"的量。
+    entries: int = 0
+    llm_requests: int = 0
+    skips: int = 0
+    aggregation_anomalies: int = 0
 
     def as_dict(self) -> dict[str, int]:
         """导出为可 JSON 序列化的字典。"""

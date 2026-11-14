@@ -1,6 +1,6 @@
 # 对话认知中枢（Cognitive Turn Manager）
 
-> **状态：v0.2（可运行）**。长期记忆（跨会话抽取 / 召回 / 管理）、话题软边界、
+> **状态：v0.4.1（可运行）**。长期记忆（跨会话抽取 / 召回 / 管理）、话题软边界、
 > 关系状态与异步归档已实现；`on_message → on_llm_request → on_llm_response`
 > 全链路可用，默认配置即可工作，核心零第三方依赖。
 
@@ -110,6 +110,7 @@ ctm/
 ├── store.py            唯一 SQLite 入口
 ├── commands.py         /ctm 子命令
 ├── observability.py    日志码与诊断计数
+├── bindings.py         handler 绑定自检（防"静默不派发"）
 ├── web_api.py          页面只读 API
 └── longterm/           长期记忆（config/store/retriever/extractor/manager）
 ```
@@ -126,8 +127,29 @@ python tests/eval_topic_detection.py --db ~/.astrbot/data/data_v4.db
 ```
 
 `tests/eval_topic_detection.py` 用真实聊天记录跑启发式判定，输出混淆矩阵、
-精确率/召回率/F1 与模型调用占比（时间间隔代理真值）。`tests/` 不加载 AstrBot：`ctm/*` 与 `ctm/longterm/*` 均为纯标准库，事件对象用
-最小替身；`main.py` 的 AstrBot 接线只做导入级 smoke。
+精确率/召回率/F1 与模型调用占比（时间间隔代理真值）。`tests/` 默认不加载 AstrBot：
+`ctm/*` 与 `ctm/longterm/*` 均为纯标准库，事件对象用最小替身；需要 AstrBot 的
+接线测试（`test_import.py` / `test_entry_and_fallback.py`）在本机装了 AstrBot 时
+自动运行，否则条件跳过。
+
+## 排障
+
+插件"看起来正常但完全没反应"时，按顺序看三处：
+
+1. **启动自检**：搜日志 `handler 绑定自检`。若出现
+   `WARN_HANDLER_BINDING ... handler 必须是本插件的类方法`，说明 handler
+   被写成了模块级函数——框架会把实例 partial 到第一个位置参数，派发时
+   `TypeError` 并被吞掉（v0.4.0 的故障）。
+2. **入口有没有进来**：默认每条消息有一条 `INFO_ENTRY`（含 `session_id`、`text_len`）。
+   有它但没有 `INFO_DECISION` → 搜 `DEBUG_SKIP`，那里的 `reason` 就是卡住的步骤
+   （`disabled` / `mode_off` / `session_off` / `empty_text` / `aggregating_follower` /
+   `inject_off` …）。把面板日志级别调到 DEBUG 才能看到 `DEBUG_SKIP`。
+3. **请求钩子有没有兜底**：搜 `WARN_NO_DECISION`（带 reason）与
+   `WARN_PREEMPTED`。只有请求钩子被调用、`entries=0` 时，多半是同优先级的其他
+   插件 `stop_event()` 抢占了事件，或本插件被会话级禁用；`/ctm health` 会直接提示。
+
+`/ctm health` 会打印 `handlers: ok（N 个已绑定本实例）` 与入口计数
+（`entries / decisions / skips / no_decision / llm_requests`）。
 
 ## 许可
 

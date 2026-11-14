@@ -1,5 +1,56 @@
 # CHANGELOG
 
+## v0.4.1
+
+### 修复（**重要：v0.4.0 在真机上完全静默、一条消息都不处理**）
+
+- **根因**：5 个 `@filter.*` handler 写成了模块级函数（`async def ctm_on_event(event)`）。
+  AstrBot 装载插件时会把插件实例 `functools.partial` 绑到 handler 的第一个位置参数上
+  （`astrbot/core/star/star_manager.py`，4.26 / 4.28 / 4.29 一致），于是派发变成
+  `ctm_on_event(实例, event)` → `TypeError: takes 1 positional argument but 2 were given`；
+  该异常被 `pipeline/context_utils.py` 的 `call_handler` 吞掉，只留一行框架 ERROR
+  （`Plugin Handler arguments do not match its definition.`），随后照常调用 LLM。
+  外部表现：插件加载成功、启动日志正常、配置生效，但 `on_message` / `on_llm_request` /
+  `on_llm_response` / 两个命令全部不执行 —— 库里 0 行、插件日志 0 行、回复无延迟。
+- 5 个 handler 改为 `CtmPlugin` 的类方法（第一参数 `self`），行为不变。
+- 新增启动自检 `ctm/bindings.py` + `CtmPlugin._verify_handler_binding()`：核对每个 handler
+  是否已注册、是否绑定到本实例；异常时打 `WARN_HANDLER_BINDING` 并在日志里点明后果。
+
+### 新增（让"静默失效"这一类故障以后一定留痕）
+
+- 入口 `INFO_ENTRY`：每条消息记 `session_id / text_len / mode / enabled / aggregate`。
+- 4 个静默 return 点各记一条 `DEBUG_SKIP`，带稳定 `reason`
+  （`disabled` / `mode_off` / `session_off` / `command` / `empty_text` /
+  `aggregating_follower` / `empty_after_aggregate` / `inject_off`）。
+- `on_llm_request` 记 `DEBUG_LLM_REQUEST`；`WARN_NO_DECISION` 不再受
+  `diag.decisions == 0` 门禁限制（计数为 0 恰恰最需要留痕），并带上原因码。
+- `Diag` 新增 `entries / llm_requests / skips / aggregation_anomalies`；
+  `/ctm status`、`/ctm health` 展示入口计数与 handler 绑定自检结果。
+- `/ctm health` 在"只有请求钩子被调用、消息入口从未进入"时给出明确提示
+  （多半是同优先级插件 `stop_event()` 抢占，或本插件被会话级禁用）。
+
+### 修复（兜底死锁）
+
+- `_fallback_decision` 不再要求话题栈非空：空栈时用**不落库**的临时焦点
+  （`_ephemeral_state`）照常判定并注入，避免"入口被抢占 → 栈永远为空 →
+  兜底永远放弃 → 整类故障完全静默"的闭环。原因记为 `empty_stack_recovered`。
+
+### 加固
+
+- `Aggregator` 的 owner 等待加超时兜底（`max_wait + 5s`）：定时器异常时不再永久挂住
+  用户消息；轮次溢出与超时通过 `on_anomaly` 回调记 WARN。
+- `configure()` 提前到 `__init__`：即使 `initialize()` 因配置未启用提前返回，
+  入口日志也一定能打出来。
+- `basic.enabled=false` 由 INFO 改为 WARN，明确提示"插件不工作"。
+
+### 测试
+
+- 新增 `tests/test_bindings.py`（纯标准库）：把"模块级单参 handler 会被误绑"固化成回归用例。
+- 新增 `tests/test_entry_and_fallback.py`：入口/跳过日志、空栈兜底、NO_DECISION 留痕。
+- `tests/test_import.py` 增加断言：5 个 handler 必须是 `(self, event)` 类方法，
+  且模块顶层不允许再出现同名函数。
+- 全量 `48 tests ... OK`（无 AstrBot 环境时 11 项条件跳过）。
+
 ## v0.4.0
 
 ### 新增
